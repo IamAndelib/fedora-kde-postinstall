@@ -16,7 +16,7 @@ jobs:
     name: Lint + hardware scenarios (stubbed)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Published checksum matches the script
         run: sha256sum -c fedora-kde-setup.sh.sha256
       - name: shellcheck
@@ -36,12 +36,12 @@ jobs:
     container:
       image: registry.fedoraproject.org/fedora:${{ matrix.release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run the script for real and check the result
         run: bash tests/fedora-integration.sh ./fedora-kde-setup.sh
       - name: Upload the script's log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: fedora-${{ matrix.release }}-log
           path: /var/log/fedora-kde-setup.log
