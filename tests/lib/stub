@@ -1,0 +1,493 @@
+#!/usr/bin/env bash
+# Generic command stub for the fedora-kde-setup.sh test harness.
+#
+# The harness symlinks this file under the name of every external command the
+# script may run (dnf5, rpm, systemctl, ...). It logs its argv to $FKS_CALLS,
+# one line per call, then answers from the scenario state in $FKS_STATE:
+#
+#   conf            KEY=VALUE settings, sourced (see the FKS_* defaults below)
+#   installed       installed package names (rpm -q / rpm -qa)
+#   available       packages "dnf5 list --available" finds
+#   unavailable     packages "dnf5 install" can't find (skipped, not installed)
+#   repos           "dnf5 repolist --enabled" repo ids
+#   kernels         kernel-core VERSION-RELEASE.ARCH lines
+#   owned           paths "rpm -qf" reports as owned by a package
+#   desktop_pkgs    packages whose "rpm -ql" lists a .desktop file
+#   remove_extra    "TRIGGER PKG..." lines: a "remove ... --assumeno" that includes
+#                   TRIGGER (or any remove, for TRIGGER "*") also lists PKG...
+#   units           systemd units "systemctl cat" finds
+#   pk_active       number of "systemctl is-active packagekit.service" calls still
+#                   answered "active"
+#   passwd          passwd(5) lines for getent / id
+#   lspci           SLOT|DESCRIPTION|NAME lines for lspci -s
+#   flatpak_remotes / flatpak_origins   flatpak query output
+#   fail            extended regexes; a call whose "name args" matches one exits 1
+#   pool/           stubs that "dnf5 install <pkg>" moves into PATH
+#
+# It never runs a real command, so nothing on the host can change. The only files it
+# writes are in $FKS_STATE and, like the real tools would, under $FKS_ROOT.
+
+set -u
+
+name=${0##*/}
+stubdir=${0%/*}
+state=${FKS_STATE:?FKS_STATE is not set}
+line="$name${*:+ $*}"
+printf '%s\n' "${line//$'\n'/\\n}" >> "${FKS_CALLS:?FKS_CALLS is not set}"
+# Without a fake root there is nothing safe to act on: record the call and stop.
+root=${FKS_ROOT:-}
+if [[ -z $root ]]; then
+    echo "stub: $name called without FKS_ROOT" >&2
+    exit 127
+fi
+scenario_dir=${state%/*}
+
+# Defaults, overridable per scenario in $state/conf.
+FKS_FEDORA=41
+FKS_SB=disabled             # enabled | disabled | unsupported
+FKS_VIRT=none               # what "systemd-detect-virt --vm" reports
+FKS_CONTAINER_VIRT=""       # non-empty: "systemd-detect-virt --container" says container
+FKS_CPU_VENDOR=GenuineIntel
+FKS_CPU_MODEL="Test CPU"
+FKS_UNAME_R=6.11.4-301.fc41.x86_64
+FKS_UPGRADE_KERNEL=""       # kernel "dnf5 upgrade --refresh" installs (live mode)
+FKS_NVIDIA_MAIN_VER=""      # "dnf5 repoquery ... xorg-x11-drv-nvidia" answer
+FKS_DNF_PLAN_ERROR=0        # "dnf5 remove --assumeno" fails to resolve
+FKS_OFFLINE=0
+FKS_MOK_STATE=new           # new | enrolled | pending
+FKS_MOK_IMPORT_RC=0
+FKS_KMODGENCA_CREATES=1
+FKS_FWUPD_RC=2
+FKS_MODS_BUILT=1
+FKS_MOD_SIGNER="akmods local signing key"
+FKS_PIM_RUNNING=0
+FKS_DATE="2026-01-02 03:04:05"
+FKS_WHOAMI=tester
+FKS_OPENSSL_RAND=a1b2c3d4
+FKS_SIGINT_ON=""            # regex: a matching call sends SIGINT to the script (Ctrl-C)
+FKS_ARCH=x86_64
+FKS_DF_ROOT=51200           # free MiB per filesystem ("" = df fails)
+FKS_DF_VAR=51200
+FKS_DF_BOOT=800
+FKS_PKG_MGR_RUNNING=0       # "pgrep -x 'dnf5|dnf|rpm|...'" finds a process
+FKS_CHECKSIG=ok             # ok | bad | unsigned | notexact | okfail
+FKS_RPM_QP_NAME=""          # "rpm -qp --qf %{NAME}" answer (default: from the file name)
+FKS_CURL_FAIL_RE=""         # regex: downloads from matching URLs fail
+FKS_HEAD_FAIL_RE=""         # regex: HEAD requests (-fsIL) to matching URLs fail
+FKS_HISTORY_LAST=17         # newest "dnf5 history list" ID ("" = empty history)
+if [[ -f $state/conf ]]; then
+    # shellcheck source=/dev/null
+    source "$state/conf"
+fi
+
+listed() {  # $1 = item, $2 = state file
+    [[ -f $state/$2 ]] && grep -qxF -- "$1" "$state/$2"
+}
+
+add_line() {  # $1 = item, $2 = state file
+    listed "$1" "$2" || printf '%s\n' "$1" >> "$state/$2"
+}
+
+del_line() {  # $1 = item, $2 = state file
+    local f=$state/$2 rest
+    [[ -f $f ]] || return 0
+    rest=$(grep -vxF -- "$1" "$f" || true)
+    if [[ -n $rest ]]; then printf '%s\n' "$rest" > "$f"; else : > "$f"; fi
+}
+
+if [[ -f $state/fail ]]; then
+    while IFS= read -r re; do
+        [[ -n $re && $line =~ $re ]] || continue
+        echo "$name: forced failure (stub)" >&2
+        exit 1
+    done < "$state/fail"
+fi
+
+if [[ -n $FKS_SIGINT_ON && $line =~ $FKS_SIGINT_ON ]]; then
+    kill -INT "$PPID"
+fi
+
+# A package that ships a command makes that command's stub appear.
+provide() {  # $1 = package
+    local cmd
+    case $1 in
+        flatpak) cmd=flatpak ;;
+        fwupd)   cmd=fwupdmgr ;;
+        mokutil) cmd=mokutil ;;
+        openssl) cmd=openssl ;;
+        pciutils) cmd=lspci ;;
+        akmod-nvidia*) add_line nvidia-fallback.service units; return 0 ;;
+        *) return 0 ;;
+    esac
+    if [[ -e $state/pool/$cmd && ! -e $stubdir/$cmd ]]; then
+        mv "$state/pool/$cmd" "$stubdir/$cmd"
+    fi
+}
+
+transaction_table() {  # packages
+    local p
+    printf 'Package                      Arch    Version              Repository        Size\n'
+    printf 'Removing:\n'
+    for p in "$@"; do printf ' %-28s x86_64  1.0-1.fc%s       updates      1.2 MiB\n' "$p" "$FKS_FEDORA"; done
+    printf '\nTransaction Summary:\n Removing:          %d packages\n\n' "$#"
+    printf 'After this operation, 12 MiB will be freed (install 0 B, remove 12 MiB).\nOperation aborted by the user.\n'
+}
+
+stub_dnf() {
+    local a sub="" assumeno=0 available=0 skip=0 ops=() p
+    for a in "$@"; do
+        case $a in
+            --assumeno) assumeno=1 ;;
+            --available) available=1 ;;
+            --skip-unavailable) skip=1 ;;
+            -*) ;;
+            *) if [[ -z $sub ]]; then sub=$a; else ops+=("$a"); fi ;;
+        esac
+    done
+
+    case $sub in
+        list)
+            (( available )) || return 0
+            for p in "${ops[@]}"; do
+                listed "$p" available || { echo "No matching packages to list" >&2; return 1; }
+                printf 'Available packages\n%s.x86_64 1.0-1.fc%s rpmfusion\n' "$p" "$FKS_FEDORA"
+            done
+            ;;
+        repolist)
+            [[ -f $state/repos ]] && cat "$state/repos"
+            return 0
+            ;;
+        history)
+            printf 'ID Command line                          Date and time       Action(s) Altered\n'
+            if [[ -n $FKS_HISTORY_LAST ]]; then
+                local id
+                for (( id = FKS_HISTORY_LAST; id > 0 && id > FKS_HISTORY_LAST - 3; id-- )); do
+                    printf '%2d dnf5 install -y something           2026-01-01 10:00:00 Install         1\n' "$id"
+                done
+            fi
+            return 0
+            ;;
+        repoquery)
+            [[ -n $FKS_NVIDIA_MAIN_VER ]] && printf '%s\n' "$FKS_NVIDIA_MAIN_VER"
+            return 0
+            ;;
+        remove)
+            if (( assumeno )); then
+                if (( FKS_DNF_PLAN_ERROR )); then
+                    echo "Error: Failed to obtain rpm transaction lock. Another transaction is in progress."
+                    return 1
+                fi
+                local pkgs=("${ops[@]}") trigger extra
+                if [[ -f $state/remove_extra ]]; then
+                    while read -r trigger extra; do
+                        [[ -n $trigger ]] || continue
+                        if [[ $trigger == "*" ]] || printf '%s\n' "${ops[@]}" | grep -qxF -- "$trigger"; then
+                            read -ra extra <<< "$extra"
+                            pkgs+=("${extra[@]}")
+                        fi
+                    done < "$state/remove_extra"
+                fi
+                transaction_table "${pkgs[@]}"
+                return 1
+            fi
+            for p in "${ops[@]}"; do del_line "$p" installed; done
+            ;;
+        install)
+            for p in "${ops[@]}"; do
+                [[ $p == */* || $p == @* ]] && continue
+                if listed "$p" unavailable; then
+                    (( skip )) && continue
+                    echo "Failed to resolve the transaction: No match for argument: $p" >&2
+                    return 1
+                fi
+                add_line "$p" installed
+                provide "$p"
+            done
+            ;;
+        swap)
+            (( ${#ops[@]} >= 2 )) || return 1
+            del_line "${ops[0]}" installed
+            add_line "${ops[1]}" installed
+            ;;
+        upgrade)
+            if [[ -n $FKS_UPGRADE_KERNEL && " $* " == *" --refresh "* ]]; then
+                add_line "$FKS_UPGRADE_KERNEL" kernels
+            fi
+            ;;
+        *) ;;  # config-manager, group, ...
+    esac
+    return 0
+}
+
+stub_rpm() {
+    case ${1:-} in
+        -q)
+            shift
+            if [[ ${1:-} == --quiet ]]; then
+                listed "${2:-}" installed
+                return
+            fi
+            if [[ ${1:-} == --qf ]]; then
+                if [[ ${3:-} == kernel-core ]] && listed kernel-core installed && [[ -s $state/kernels ]]; then
+                    cat "$state/kernels"
+                    return 0
+                fi
+                echo "package ${3:-} is not installed"
+                return 1
+            fi
+            listed "${1:-}" installed && echo "${1:-}-1.0-1.fc$FKS_FEDORA.x86_64"
+            ;;
+        -qa)
+            [[ -f $state/installed ]] && cat "$state/installed"
+            return 0
+            ;;
+        -ql)
+            listed "${2:-}" installed || { echo "package ${2:-} is not installed"; return 1; }
+            printf '/usr/lib64/lib%s.so.1\n' "${2:-}"
+            if listed "${2:-}" desktop_pkgs; then
+                printf '/usr/bin/%s\n/usr/share/applications/org.kde.%s.desktop\n' "${2:-}" "${2:-}"
+            fi
+            ;;
+        -qf)
+            if listed "${2:-}" owned; then echo "owner-1.0-1.fc$FKS_FEDORA.noarch"; return 0; fi
+            echo "file ${2:-} is not owned by any package"
+            return 1
+            ;;
+        -qp)
+            f=${*: -1}
+            if [[ -n $FKS_RPM_QP_NAME ]]; then
+                printf '%s' "$FKS_RPM_QP_NAME"
+            else
+                f=${f##*/}
+                printf '%s' "${f%.noarch.rpm}"
+            fi
+            ;;
+        -E)
+            if [[ ${2:-} == %fedora ]]; then echo "$FKS_FEDORA"; else echo "${2:-}"; fi
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+stub_lspci() {
+    local slot="" s desc pname
+    [[ ${1:-} == -s ]] && slot=${2:-}
+    [[ -f $state/lspci ]] || return 0
+    while IFS='|' read -r s desc pname; do
+        [[ -z $slot || $s == "$slot" ]] || continue
+        printf '%s %s: %s\n' "${s#0000:}" "$desc" "$pname"
+    done < "$state/lspci"
+}
+
+stub_mokutil() {
+    case ${1:-} in
+        --sb-state)
+            case $FKS_SB in
+                enabled)  echo "SecureBoot enabled" ;;
+                disabled) echo "SecureBoot disabled" ;;
+                *) echo "EFI variables are not supported on this system" >&2; return 1 ;;
+            esac
+            ;;
+        --test-key)
+            case $FKS_MOK_STATE in
+                enrolled) echo "${2:-} is already enrolled" ;;
+                pending)  echo "${2:-} is already in the enrollment request" ;;
+                *)        echo "${2:-} is not enrolled" ;;
+            esac
+            ;;
+        --generate-hash=*)
+            # shellcheck disable=SC2016  # a literal crypt hash
+            echo '$6$stubsalt$stubhash'
+            ;;
+        --import) return "$FKS_MOK_IMPORT_RC" ;;
+        *) return 0 ;;
+    esac
+}
+
+stub_detect_virt() {
+    local a vm=0 container=0 quiet=0 v
+    for a in "$@"; do
+        case $a in
+            -v|--vm) vm=1 ;;
+            -c|--container) container=1 ;;
+            -q|--quiet) quiet=1 ;;
+        esac
+    done
+    if (( container )); then
+        v=${FKS_CONTAINER_VIRT:-none}
+    elif (( vm )); then
+        v=$FKS_VIRT
+    else
+        v=${FKS_CONTAINER_VIRT:-$FKS_VIRT}
+    fi
+    (( quiet )) || echo "$v"
+    [[ $v != none ]]
+}
+
+stub_systemctl() {
+    local n
+    case ${1:-} in
+        cat)
+            listed "${2:-}" units || { echo "No files found for ${2:-}." >&2; return 1; }
+            echo "# /usr/lib/systemd/system/${2:-}"
+            ;;
+        is-active)
+            n=$(cat "$state/pk_active" 2>/dev/null || echo 0)
+            if [[ ${*: -1} == packagekit.service ]] && (( n > 0 )); then
+                echo $((n - 1)) > "$state/pk_active"
+                return 0
+            fi
+            return 3
+            ;;
+    esac
+    return 0
+}
+
+stub_id() {
+    local name_only=0 a arg="" uid entry
+    for a in "$@"; do
+        case $a in
+            -nu|-un) name_only=1 ;;
+            -u) ;;
+            *) arg=$a ;;
+        esac
+    done
+    if (( name_only )); then
+        if [[ -z $arg ]]; then
+            if (( EUID == 0 )); then echo root; else echo "$FKS_WHOAMI"; fi
+            return 0
+        fi
+        entry=$(grep -E "^[^:]*:[^:]*:$arg:" "$state/passwd" | head -n1)
+        [[ -n $entry ]] || { echo "id: '$arg': no such user" >&2; return 1; }
+        echo "${entry%%:*}"
+        return 0
+    fi
+    if [[ -z $arg ]]; then echo "$EUID"; return 0; fi
+    entry=$(grep -E "^$arg:" "$state/passwd" | head -n1)
+    [[ -n $entry ]] || { echo "id: '$arg': no such user" >&2; return 1; }
+    IFS=: read -r _ _ uid _ <<< "$entry"
+    echo "$uid"
+}
+
+case $name in
+    dnf|dnf5) stub_dnf "$@" ;;
+    rpm) stub_rpm "$@" ;;
+    lspci) stub_lspci "$@" ;;
+    lscpu) printf 'Architecture:  x86_64\nVendor ID:     %s\nModel name:    %s\n' "$FKS_CPU_VENDOR" "$FKS_CPU_MODEL" ;;
+    mokutil) stub_mokutil "$@" ;;
+    systemd-detect-virt) stub_detect_virt "$@" ;;
+    systemctl) stub_systemctl "$@" ;;
+    flatpak)
+        case "${1:-} ${2:-}" in
+            "remotes --columns=name") [[ -f $state/flatpak_remotes ]] && cat "$state/flatpak_remotes" ;;
+            "list --columns=origin") [[ -f $state/flatpak_origins ]] && cat "$state/flatpak_origins" ;;
+        esac
+        exit 0
+        ;;
+    fwupdmgr) if [[ ${1:-} == update ]]; then exit "$FKS_FWUPD_RC"; fi ;;
+    curl)
+        (( FKS_OFFLINE )) && exit 6
+        out="" url=${*: -1} head=0
+        [[ " $* " == *" -fsIL "* ]] && head=1
+        while (( $# )); do
+            [[ $1 == -o ]] && { out=${2:-}; shift; }
+            shift
+        done
+        if (( head )) && [[ -n $FKS_HEAD_FAIL_RE && $url =~ $FKS_HEAD_FAIL_RE ]]; then
+            exit 22
+        fi
+        if (( !head )) && [[ -n $FKS_CURL_FAIL_RE && $url =~ $FKS_CURL_FAIL_RE ]]; then
+            exit 22
+        fi
+        # Downloads land only inside the scenario dir.
+        if [[ -n $out && $out != /dev/null ]]; then
+            [[ $out == "$scenario_dir"/* ]] || { echo "curl stub: refusing to write $out" >&2; exit 23; }
+            echo "stub rpm from $url" > "$out"
+        fi
+        ;;
+    df)
+        target=${*: -1}
+        case ${target#"$root"} in
+            /var|/var/) free=$FKS_DF_VAR ;;
+            /boot|/boot/) free=$FKS_DF_BOOT ;;
+            *) free=$FKS_DF_ROOT ;;
+        esac
+        [[ -n $free ]] || { echo "df: $target: No such file or directory" >&2; exit 1; }
+        printf 'Filesystem     1048576-blocks  Used Available Capacity Mounted on\n'
+        printf '/dev/vda3              100000 %5d %9d      50%% /\n' 1000 "$free"
+        ;;
+    rpmkeys)
+        case ${1:-} in
+            --checksig)
+                f=${*: -1}
+                case $FKS_CHECKSIG in
+                    ok)       echo "$f: digests signatures OK" ;;
+                    unsigned) echo "$f: digests OK" ;;
+                    # "signatures OK" appears, but only inside a path; the verdict is bad.
+                    notexact) echo "${f%/*}/signatures OK/${f##*/}: digests SIGNATURES NOT OK" ;;
+                    # The right words, but rpmkeys itself failed.
+                    okfail)   echo "$f: digests signatures OK"; exit 1 ;;
+                    *)        echo "$f: digests SIGNATURES NOT OK"; exit 1 ;;
+                esac
+                ;;
+        esac
+        ;;
+    getent)
+        [[ ${1:-} == passwd && -f $state/passwd ]] || exit 2
+        grep -E "^${2:-}:" "$state/passwd" || exit 2
+        ;;
+    id) stub_id "$@" ;;
+    pgrep)
+        if [[ ${1:-} == -x ]]; then
+            (( FKS_PKG_MGR_RUNNING )) && { echo 4321; exit 0; }
+            exit 1
+        fi
+        if (( FKS_PIM_RUNNING )) && [[ ! -e $state/pim_killed ]]; then exit 0; fi
+        exit 1
+        ;;
+    pkill) : > "$state/pim_killed" ;;
+    modinfo)
+        (( FKS_MODS_BUILT )) || { echo "modinfo: ERROR: Module ${*: -1} not found." >&2; exit 1; }
+        if [[ " $* " == *" -F signer "* ]]; then
+            [[ -n $FKS_MOD_SIGNER ]] && echo "$FKS_MOD_SIGNER"
+        fi
+        exit 0
+        ;;
+    kmodgenca)
+        if (( FKS_KMODGENCA_CREATES )); then
+            mkdir -p "$root/etc/pki/akmods/certs"
+            echo "stub certificate" > "$root/etc/pki/akmods/certs/public_key.der"
+        fi
+        ;;
+    openssl) [[ ${1:-} == rand ]] && echo "$FKS_OPENSSL_RAND"; exit 0 ;;
+    pkcon) if [[ ${1:-} == offline-cancel ]]; then rm -f "$root/system-update"; fi ;;
+    uname)
+        case ${1:-} in
+            -r) echo "$FKS_UNAME_R" ;;
+            -m) echo "$FKS_ARCH" ;;
+            *) echo Linux ;;
+        esac
+        ;;
+    date) echo "$FKS_DATE" ;;
+    runuser)
+        # runuser -u USER -- CMD...: "rm" really runs, but only on paths inside this
+        # scenario's temp dir; anything else is only recorded.
+        [[ ${1:-} == -u && ${3:-} == -- ]] || exit 1
+        shift 3
+        # The script runs "runuser -u USER -- setsid -w CMD...": setsid only detaches.
+        if [[ ${1:-} == setsid ]]; then
+            shift
+            [[ ${1:-} == -w ]] && shift
+        fi
+        if [[ ${1:-} == rm ]]; then
+            for arg in "${@:2}"; do
+                [[ $arg == -* || $arg == "$scenario_dir"/* ]] && continue
+                echo "runuser stub: refusing to delete outside the scenario: $arg" >&2
+                exit 1
+            done
+            exec "$@"
+        fi
+        ;;
+    sleep|sudo|akmods|akonadictl|kbuildsycoca6) ;;
+    *) echo "stub: no behaviour defined for '$name'" >&2; exit 127 ;;
+esac
