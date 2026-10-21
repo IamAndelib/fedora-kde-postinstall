@@ -11,8 +11,8 @@ Please **don't open a public issue** for security problems. Use GitHub's private
 Every tagged version has `fedora-kde-setup.sh` together with its SHA-256 checksum. CI checks that the checksum always matches the script:
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.0.0/fedora-kde-setup.sh
-curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.0.0/fedora-kde-setup.sh.sha256
+curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.1.0/fedora-kde-setup.sh
+curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.1.0/fedora-kde-setup.sh.sha256
 sha256sum -c fedora-kde-setup.sh.sha256
 ```
 

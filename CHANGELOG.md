@@ -1,8 +1,8 @@
 # Changelog
 
-## v1.0.0
+## v1.1.0
 
-First public release.
+First public release. (The script in this release reports `--version` as 1.0.0.)
 
 - One-shot setup for Fedora KDE Plasma 41+ (dnf5, x86_64):
   - DNF tuning and a full system update

@@ -39,8 +39,8 @@ Press the **Meta/Windows key**, type **`Konsole`**, and press **Enter**.
 Copy these two lines into Konsole and press **Enter**:
 
 ```bash
-curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.0.0/fedora-kde-setup.sh
-curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.0.0/fedora-kde-setup.sh.sha256
+curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.1.0/fedora-kde-setup.sh
+curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.1.0/fedora-kde-setup.sh.sha256
 ```
 
 ### 3. Check the download
