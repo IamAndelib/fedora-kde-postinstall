@@ -108,6 +108,7 @@ new_scenario_dirs() {  # $1 = scenario name
     EXPECT_NO_LOG=0
     KEEP_ROOT_OWNER=0
     AUTO_ALL=1
+    SCRIPT_UNDER_TEST=""
     LOCK_FD=""
     RC=""
     IS_DRY=0
@@ -164,7 +165,7 @@ invoke() {
         "PATH=$STUBDIR:$SAFEBIN" "FKS_ROOT=$R" "FKS_STATE=$S" "FKS_CALLS=$CALLS"
         "TMPDIR=$T/tmp" "HOME=$T/invoker-home" LANG=C "${RUN_ENV[@]}"
     )
-    local cmd=("$ENV_BIN" -i "${envv[@]}" "$BASH_BIN" "$SCRIPT" "${args[@]}")
+    local cmd=("$ENV_BIN" -i "${envv[@]}" "$BASH_BIN" "${SCRIPT_UNDER_TEST:-$SCRIPT}" "${args[@]}")
     local isolate=("${ROOTCMD[@]}" "$UNSHARE_BIN" --mount --propagation private -- \
         "$BASH_BIN" "$FKS_LIB/isolate.sh" "$T/hostlog")
 

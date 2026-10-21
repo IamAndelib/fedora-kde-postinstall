@@ -906,6 +906,16 @@ sc_pk_offline_update() {
     if is_live; then expect_no_file "$R/system-update"; fi
 }
 
+scenario pk_offline_not_update "dry live" "Staged offline update, update step not selected: left alone"
+sc_pk_offline_not_update() {
+    ln -s /var/lib/PackageKit/prepared-update "$R/system-update"
+    invoke --only codecs --yes --no-reboot
+    expect_success
+    expect_no_action '^pkcon offline-cancel'
+    expect_no_action "rm -f $R/system-update"
+    expect_file "$R/system-update"
+}
+
 scenario pk_offline_nopkcon "live" "Staged offline update without pkcon: rm -f fallback"
 sc_pk_offline_nopkcon() {
     fx_missing pkcon
@@ -922,7 +932,7 @@ sc_upgrade_fails() {
     EXPECT_ERRTRAP=1
     invoke --yes --no-reboot
     expect_rc nonzero
-    expect_out 'Failed \(exit 1\) at line [0-9]+ in run <- update_system <- main: '
+    expect_out 'Failed \(exit 1\) at line [0-9]+ in run <- step_update <- run_steps <- main: dnf5 upgrade --refresh -y$'
     expect_no_file "$R/var/lib/fedora-kde-setup/done"
     expect_call '^systemctl unmask --runtime packagekit.service$'
     expect_no_action '^dnf5 remove -y'
@@ -1034,23 +1044,35 @@ sc_codecs_unavailable() {
     expect_no_out 'Codecs: ffmpeg'
 }
 
-scenario pim_absent "dry live" "PIM/LibreOffice not installed; unowned leftovers removed, owned kept"
+scenario pim_absent "dry live" "PIM/LibreOffice not installed, data left: --all leaves it; --only cleans it and unowned dirs"
 sc_pim_absent() {
     fx_del installed "${FX_PIM[@]}" "${FX_OFFICE[@]}"
     mkdir -p "$R/usr/lib64/libreoffice/program" "$R/usr/share/akonadi/agents" "$R/etc/libreoffice"
     fx_add owned /etc/libreoffice
-    invoke --yes --no-reboot
+    invoke --all --yes --no-reboot
     expect_success
-    expect_out 'No KDE PIM or LibreOffice packages installed'
+    expect_no_will_do 'Remove leftover'
+    expect_no_action 'rm -rf'
+    expect_home_intact "$H"
+    # Leftover data is deleted only when that step is picked explicitly.
+    invoke --only pim,libreoffice --yes --no-reboot
+    expect_success
+    expect_will_do 'Remove leftover KDE PIM data'
+    expect_will_do 'Remove leftover LibreOffice data'
+    expect_out 'KDE PIM is not installed'
+    expect_out 'LibreOffice is not installed'
     expect_no_call 'remove .*--assumeno'
     expect_no_action '^dnf5 remove -y'
     expect_action '^dnf5 group remove -y --no-packages kde-pim$'
+    expect_action '^dnf5 group remove -y --no-packages libreoffice$'
     expect_home_cleaned "$H"
     if is_live; then
         expect_no_file "$R/usr/lib64/libreoffice"
         expect_no_file "$R/usr/share/akonadi"
         expect_file "$R/etc/libreoffice"
         expect_call_line "rpm -qf /usr/lib64/libreoffice"
+        expect_recorded pim
+        expect_recorded libreoffice
     else
         expect_action_line "rm -rf -- $R/usr/lib64/libreoffice"
         expect_action_line "rm -rf -- $R/usr/share/akonadi"
@@ -1080,7 +1102,9 @@ sc_office_guard() {
     expect_deleted "$H" "${FX_PIM_JUNK[@]}"
     expect_kept "$H" "${FX_OFFICE_JUNK[@]}"
     expect_rm_count "$H" "${#FX_PIM_JUNK[@]}"
-    expect_out_fixed "Kept LibreOffice settings in $H because LibreOffice is still installed"
+    expect_out_fixed "Kept LibreOffice data in $H because LibreOffice is still installed"
+    expect_suite_deleted "$H" "KDE PIM" "${#FX_PIM_JUNK[@]}"
+    if is_live; then expect_recorded pim; expect_not_recorded libreoffice; fi
 }
 
 scenario remove_fails "live" "dnf5 remove -y fails for KDE PIM: warning, PIM data kept, run completes"
@@ -1195,7 +1219,7 @@ sc_user_junk() {
 # ---------------------------------------------------------------------------
 # Flatpak, firmware, kernel modules
 
-scenario flatpak_setup "dry live" "flatpak + Discover backend missing; unused Fedora remotes dropped"
+scenario flatpak_setup "dry live" "Flatpak + Discover backend missing; Fedora remotes: used one kept at low prio, unused one disabled"
 sc_flatpak_setup() {
     fx_missing flatpak
     fx_del installed plasma-discover-flatpak
@@ -1207,11 +1231,29 @@ sc_flatpak_setup() {
     expect_install flatpak
     expect_install plasma-discover-flatpak
     expect_order "$(pkg_re flatpak)" '^flatpak remote-add'
-    expect_action '^flatpak remote-add --if-not-exists flathub '
-    expect_no_action '^flatpak remote-delete --force fedora$'
+    expect_action '^flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo$'
+    expect_action '^flatpak remote-modify --no-filter --enable flathub$'
+    expect_action '^flatpak remote-modify --prio=10 flathub$'
+    expect_action_line "$(as_user_prefix) kwriteconfig6 --file $H/.config/discoverrc --group ResourcesModel --key currentApplicationBackend flatpak-backend"
+    expect_no_action 'remote-delete'
     if is_live; then
-        expect_action '^flatpak remote-delete --force fedora-testing$'
+        # The flatpak command only exists once the package is installed.
+        expect_action '^flatpak remote-modify --prio=1 fedora$'
+        expect_out "Kept Fedora's 'fedora' Flatpak source enabled because apps are installed from it"
+        expect_action '^flatpak remote-modify --disable fedora-testing$'
+        expect_no_action '^flatpak remote-modify --disable fedora$'
+        expect_grep "$H/.config/discoverrc" '^currentApplicationBackend=flatpak-backend$'
+        expect_recorded flathub
     fi
+}
+
+scenario flathub_no_kwriteconfig "live" "kwriteconfig6 missing: Discover default not set, warning"
+sc_flathub_no_kwriteconfig() {
+    fx_missing kwriteconfig6
+    invoke --only flathub --yes --no-reboot
+    expect_success
+    expect_out "Couldn't make Flathub Discover's default source \\(kwriteconfig6 not found\\)"
+    expect_no_file "$H/.config/discoverrc"
 }
 
 scenario fwupd_fail "dry live" "fwupd not installed, fwupdmgr update fails: warning only"
@@ -1222,7 +1264,22 @@ sc_fwupd_fail() {
     expect_success
     expect_install fwupd
     expect_action '^fwupdmgr refresh --force$'
-    if is_live; then expect_out 'fwupdmgr exited with 1'; fi
+    if is_live; then
+        expect_out 'fwupdmgr exited with 1'
+        expect_not_recorded firmware
+        expect_out 'Not completed \(see warnings\):'
+    fi
+}
+
+scenario fwupd_refresh_fails "live" "fwupdmgr refresh fails and update says nothing to do: firmware not completed"
+sc_fwupd_refresh_fails() {
+    fx_add fail '^fwupdmgr refresh'
+    invoke --only firmware --yes --no-reboot
+    expect_success
+    expect_out "Couldn't refresh firmware metadata"
+    expect_no_out 'Firmware already up to date'
+    expect_not_recorded firmware
+    expect_out 'Finished: 0 of 1 steps done'
 }
 
 scenario kernel_update "live" "Upgrade pulls a new kernel: modules built for it"
@@ -1235,7 +1292,7 @@ sc_kernel_update() {
     expect_install "kernel-devel-$NEW_KERNEL"
     expect_action "^akmods --force --kernels $NEW_KERNEL$"
     expect_no_install "kernel-devel-$FX_KERNEL"
-    expect_out 'A reboot is needed to load the new drivers'
+    expect_out_fixed 'A reboot is recommended to start the new kernel.'
 }
 
 scenario kernel_update_nokmod "live" "New kernel, no kmods: reboot reason is the kernel"
@@ -1244,7 +1301,7 @@ sc_kernel_update_nokmod() {
     fx_conf "FKS_UPGRADE_KERNEL=$NEW_KERNEL"
     invoke --yes --no-reboot
     expect_success
-    expect_out 'A reboot is needed to boot the new kernel'
+    expect_out_fixed 'A reboot is recommended to start the new kernel.'
 }
 
 scenario kmod_not_built "live" "akmods build fails: warning, run completes"
@@ -1254,36 +1311,27 @@ sc_kmod_not_built() {
     invoke --yes --no-reboot
     expect_success
     expect_out "Kernel module 'nvidia' isn't built yet"
+    expect_not_recorded drivers
 }
 
 # ---------------------------------------------------------------------------
 # Marker, confirmation, reboot
 
-scenario marker_no_force "dry live" "Marker present, no --force: real run refuses, dry run warns"
-sc_marker_no_force() {
+scenario legacy_marker "live" "v1.1 single-date state file: no refusal, firmware shows the date, rewritten as ID lines"
+sc_legacy_marker() {
     fx_marker "2025-05-05 10:00:00"
-    invoke --yes --no-reboot
-    if is_live; then
-        expect_untouched
-        expect_out 'Setup already completed on 2025-05-05 10:00:00. Use --force to run it again.'
-        expect_grep "$R/var/lib/fedora-kde-setup/done" '^2025-05-05 10:00:00$'
-    else
-        expect_rc 0
-        expect_out 'Setup already completed on 2025-05-05 10:00:00; a real run would need --force'
-    fi
-}
-
-scenario marker_force "dry live" "Marker present with --force: runs, marker refreshed"
-sc_marker_force() {
-    fx_marker "2025-05-05 10:00:00"
-    invoke --force --yes --no-reboot
+    invoke --status
     expect_rc 0
+    expect_out 'Firmware updates \[Recommended\]  • last checked 2025-05-05'
     expect_no_out 'already completed'
-    if is_live; then
-        expect_grep "$R/var/lib/fedora-kde-setup/done" '^2026-01-02 03:04:05$'
-    else
-        expect_grep "$R/var/lib/fedora-kde-setup/done" '^2025-05-05 10:00:00$'
-    fi
+    invoke --only dnf --yes --no-reboot
+    expect_success
+    expect_recorded dnf
+    local id
+    for id in update codecs drivers pim libreoffice flathub firmware maintenance; do
+        expect_grep "$(state_file)" "^$id 2025-05-05 10:00:00$"
+    done
+    expect_count "$(state_file)" '^2025-05-05' 0
 }
 
 scenario no_tty_no_yes "live" "No terminal and no --yes: abort before any change, tell user about --yes"
@@ -1301,7 +1349,7 @@ sc_tty_confirm_yes() {
     invoke
     expect_success
     expect_out 'Proceed\? \[y/N\]'
-    expect_out 'Reboot now\? \[Y/n\]'
+    expect_out 'Reboot now\? \(recommended\) \[Y/n\]'
     expect_call '^systemctl reboot$'
 }
 
@@ -1327,31 +1375,42 @@ sc_assume_yes() {
     expect_success
     expect_no_out 'Proceed\?'
     expect_no_out 'Reboot now'
-    expect_out 'A reboot is needed'
+    expect_out 'A reboot is recommended'
 }
 
 # ---------------------------------------------------------------------------
 # Target user
 
-scenario root_no_user "dry live" "Root, no SUDO_USER, no --user: real run dies"
+scenario root_no_user "dry live" "Plain root, no SUDO_USER/--user, PIM selected: real run dies"
 sc_root_no_user() {
     RUN_ENV=()
     invoke --yes --no-reboot
     if is_live; then
         expect_untouched
-        expect_out "Can't tell which user to clean up"
+        expect_out "Can't tell whose KDE PIM/LibreOffice data to clean up"
     else
         expect_rc 0
-        expect_out "cleaning up for user '(root|tester)'"
+        expect_out "user '(root|tester)'"
     fi
 }
 
-scenario sudo_user_root "live" "SUDO_USER=root (sudo from a root shell): real run dies"
+scenario root_no_user_update "live" "Plain root, no user: --only update works (no user data involved)"
+sc_root_no_user_update() {
+    RUN_ENV=()
+    invoke --only update --yes --no-reboot
+    expect_success
+    expect_out "user 'unknown'"
+    expect_no_out "Can't tell whose"
+    expect_action '^dnf5 upgrade --refresh -y$'
+    expect_recorded update
+}
+
+scenario sudo_user_root "live" "SUDO_USER=root (sudo from a root shell), PIM selected: real run dies"
 sc_sudo_user_root() {
     RUN_ENV=(SUDO_USER=root)
     invoke --yes --no-reboot
     expect_untouched
-    expect_out "Can't tell which user to clean up"
+    expect_out "Can't tell whose KDE PIM/LibreOffice data to clean up"
 }
 
 scenario user_root "dry live" "--user root: real run refuses, dry run warns"
@@ -1374,7 +1433,7 @@ sc_pkexec_uid() {
     RUN_ENV=("PKEXEC_UID=$FX_UID")
     invoke --yes --no-reboot
     expect_success
-    expect_out "cleaning up for user 'tester'"
+    expect_out "user 'tester'"
     expect_home_cleaned "$H"
 }
 
@@ -1384,7 +1443,7 @@ sc_user_option() {
     fx_home_junk "$T/home/alice"
     invoke --user tester --yes --no-reboot
     expect_success
-    expect_out "cleaning up for user 'tester'"
+    expect_out "user 'tester'"
     expect_home_cleaned "$H"
     expect_home_intact "$T/home/alice"
     expect_no_action "home/alice"
@@ -1395,7 +1454,7 @@ sc_user_eq_form() {
     RUN_ENV=(SUDO_USER=alice)
     invoke --user=tester --yes
     expect_success
-    expect_out "cleaning up for user 'tester'"
+    expect_out "user 'tester'"
 }
 
 scenario user_unknown "dry live" "--user ghost: real run dies, dry run warns and skips user data"
@@ -1407,7 +1466,8 @@ sc_user_unknown() {
     else
         expect_rc 0
         expect_out "\\(dry-run\\) User 'ghost' doesn't exist"
-        expect_out "No home directory for 'ghost'; skipped deleting PIM/LibreOffice user data"
+        expect_out "\\(dry-run\\) Can't tell whose KDE PIM/LibreOffice data to clean up"
+        expect_out "No home directory for 'ghost'; skipped deleting KDE PIM user data"
         expect_out 'Dry run finished'
     fi
 }
@@ -1496,6 +1556,36 @@ sc_preflight_mirror_fallback() {
     expect_no_out "Can't download"
 }
 
+scenario net_fedora_down "dry live" "Fedora mirrors unreachable with the update step: refused"
+sc_net_fedora_down() {
+    fx_conf 'FKS_HEAD_FAIL_RE=^https://mirrors\.fedoraproject\.org/'
+    invoke --only update --yes --no-reboot
+    expect_out_fixed "Can't reach Fedora's mirrors (https://mirrors.fedoraproject.org). Check the internet connection."
+    expect_no_call 'rpmfusion'
+    if is_live; then expect_untouched; else expect_rc 0; fi
+}
+
+scenario net_flathub_down "dry live" "Flathub unreachable with the flathub step: refused"
+sc_net_flathub_down() {
+    fx_conf 'FKS_HEAD_FAIL_RE=^https://dl\.flathub\.org/'
+    invoke --only flathub --yes --no-reboot
+    expect_out_fixed "Can't reach Flathub (https://dl.flathub.org). Check the internet connection."
+    expect_no_call 'rpmfusion|fedoraproject'
+    if is_live; then expect_untouched; else expect_rc 0; fi
+}
+
+scenario net_probes_by_step "live" "Only the hosts the selected steps need are probed"
+sc_net_probes_by_step() {
+    invoke --only codecs --yes --no-reboot
+    expect_call_line "$CURL_HEAD $(rf_url free 41)"
+    expect_no_call 'fedoraproject|dl\.flathub'
+    invoke --only firmware --yes --no-reboot
+    expect_call_line "$CURL_HEAD https://mirrors.fedoraproject.org/"
+    expect_no_call 'rpmfusion|dl\.flathub'
+    invoke --only dnf,pim,maintenance --yes --no-reboot
+    expect_no_call '^curl'
+}
+
 scenario not_root "user" "Unprivileged: real run refuses, dry run works and logs to TMPDIR"
 sc_not_root() {
     invoke --yes --no-reboot
@@ -1512,7 +1602,7 @@ sc_help() {
     EXPECT_NO_LOG=1
     invoke --help
     expect_rc 0
-    expect_out '^Usage: sudo \./fedora-kde-setup\.sh \[options\]$'
+    expect_out '^Usage: sudo bash fedora-kde-setup\.sh \[options\]$'
     expect_out '--dry-run'
     expect_out '-V, --version'
     check "no command called" not test -s "$CALLS"
@@ -1523,7 +1613,7 @@ sc_version() {
     EXPECT_NO_LOG=1
     invoke -V
     expect_rc 0
-    expect_out '^fedora-kde-setup 1\.0\.0$'
+    expect_out '^fedora-kde-setup 1\.2\.0$'
     check "no command called" not test -s "$CALLS"
 }
 
@@ -1704,16 +1794,15 @@ sc_rails_pkgmgr_running() {
     rail_refused 'Another package manager \(dnf/rpm\) is running'
 }
 
-scenario rails_order "live" "Rails run after the user checks and before the lock"
+scenario rails_order "live" "Safety rails run before the lock (low disk wins over a held lock)"
 sc_rails_order() {
-    fx_conf FKS_ARCH=aarch64
+    fx_conf FKS_DF_ROOT=100
     hold_lock
     invoke --yes --no-reboot
     release_lock
     expect_untouched
-    expect_out 'supports x86_64 only'
+    expect_out 'Only 100 MiB free on /'
     expect_no_out 'Another run of this script'
-    expect_order '^getent passwd tester' '^uname -m'
 }
 
 scenario user_bad_name "dry live" "--user 'Bad;Name': invalid user name refused"
@@ -1725,7 +1814,7 @@ sc_user_bad_name() {
         expect_untouched
     else
         expect_rc 0
-        expect_out 'skipped deleting PIM/LibreOffice user data'
+        expect_out "\\(dry-run\\) Can't tell whose KDE PIM/LibreOffice data to clean up"
     fi
 }
 
@@ -1739,13 +1828,30 @@ sc_user_system() {
 # ---------------------------------------------------------------------------
 # RPM Fusion bootstrap
 
-rf_refused() {  # MESSAGE: dies after the upgrade, before installing the release packages
-    expect_rc nonzero
+# RPM Fusion couldn't be set up: codecs (and drivers) are skipped, the run goes on.
+rf_refused() {  # MESSAGE
+    expect_rc 0
     expect_out_fixed "$1"
+    expect_out_fixed "Skipped the codecs: they come from RPM Fusion, which couldn't be set up"
     expect_no_action '^dnf5 install -y .*/rpmfusion-'
     expect_no_action 'appstream-data|ffmpeg'
-    expect_no_file "$R/var/lib/fedora-kde-setup/done"
+    expect_not_recorded codecs
+    expect_recorded flathub
+    expect_recorded maintenance
+    expect_out 'Not completed \(see warnings\):'
+    expect_out 'Finished: [0-9]+ of [0-9]+ steps done'
     expect_call '^systemctl unmask --runtime packagekit.service$'
+}
+
+scenario rf_fail_drivers "live" "RPM Fusion setup fails with NVIDIA: codecs and drivers skipped, rest runs"
+sc_rf_fail_drivers() {
+    fx_gpu_nvidia "${NV_TU106[@]}"
+    fx_conf FKS_CHECKSIG=bad
+    invoke --yes --no-reboot
+    rf_refused 'Signature check failed for the RPM Fusion free release package'
+    expect_out_fixed "Skipped the drivers: they come from RPM Fusion, which couldn't be set up"
+    expect_no_action 'install .*akmod-nvidia'
+    expect_not_recorded drivers
 }
 
 scenario rf_verified "dry live" "Release packages downloaded over HTTPS, signatures checked, installed from local files"
@@ -1778,7 +1884,7 @@ sc_rf_gpgkeys_missing() {
     expect_order '^dnf5 install -y distribution-gpg-keys$' '^rpmkeys --import'
 }
 
-scenario rf_bad_signature "live" "rpmkeys --checksig: SIGNATURES NOT OK: dies, nothing installed"
+scenario rf_bad_signature "live" "rpmkeys --checksig: SIGNATURES NOT OK: codecs skipped, nothing from RPM Fusion installed"
 sc_rf_bad_signature() {
     fx_conf FKS_CHECKSIG=bad
     invoke --yes --no-reboot
@@ -1786,14 +1892,14 @@ sc_rf_bad_signature() {
     expect_out 'digests SIGNATURES NOT OK'
 }
 
-scenario rf_unsigned "live" "rpmkeys --checksig: digests OK but no signature: dies"
+scenario rf_unsigned "live" "rpmkeys --checksig: digests OK but no signature: codecs skipped"
 sc_rf_unsigned() {
     fx_conf FKS_CHECKSIG=unsigned
     invoke --yes --no-reboot
     rf_refused 'Signature check failed for the RPM Fusion free release package'
 }
 
-scenario rf_no_key "live" "RPM Fusion key missing from distribution-gpg-keys: dies before downloading"
+scenario rf_no_key "live" "RPM Fusion key missing from distribution-gpg-keys: codecs skipped, nothing downloaded"
 sc_rf_no_key() {
     rm -f "$(rf_key free 41)"
     invoke --yes --no-reboot
@@ -1825,7 +1931,7 @@ sc_rf_mirror_fallback() {
     expect_action '^dnf5 install -y .*/rpmfusion-free-release\.noarch\.rpm .*/rpmfusion-nonfree-release\.noarch\.rpm$'
 }
 
-scenario rf_download_fails "live" "Both RPM Fusion hosts fail: dies"
+scenario rf_download_fails "live" "Both RPM Fusion hosts fail: codecs skipped"
 sc_rf_download_fails() {
     fx_conf 'FKS_CURL_FAIL_RE=rpmfusion\.org/'
     invoke --yes --no-reboot
@@ -1835,13 +1941,12 @@ sc_rf_download_fails() {
 # ---------------------------------------------------------------------------
 # Undo information, environment hardening
 
-scenario history_empty "live" "Empty dnf history: undo hint says after #0"
+scenario history_empty "live" "Empty dnf history before the run: no undo line (no start ID)"
 sc_history_empty() {
     fx_conf FKS_HISTORY_LAST=
     invoke --yes --no-reboot
     expect_success
-    expect_out_fixed '(this run: transactions after #0);'
-    expect_out_fixed 'undo one with "sudo dnf history undo <ID>".'
+    expect_no_out 'dnf history list'
 }
 
 scenario history_dry "dry" "Dry run prints no undo hint"
@@ -1865,7 +1970,7 @@ sc_path_reset() {
         "FKS_CALLS=$CALLS" LANG=C "$BASH_BIN" "$SCRIPT" --help ) </dev/null > "$OUT" 2>&1
     RC=$?
     expect_rc 0
-    expect_out '^Usage: sudo \./fedora-kde-setup\.sh \[options\]$'
+    expect_out '^Usage: sudo bash fedora-kde-setup\.sh \[options\]$'
     check "caller's PATH not used (decoy cat not called)" not test -s "$CALLS"
 
     ( cd "$T/cwd" && "$SETSID_BIN" -w "$ENV_BIN" -i "PATH=$fake:$SAFEBIN" "FKS_STATE=$S" \
@@ -1909,21 +2014,21 @@ sc_fks_root_test_banner() {
     expect_out_fixed "TEST MODE: FKS_ROOT=$R"
 }
 
-scenario rf_sig_not_exact "live" "checksig output has 'signatures OK' only inside a path: dies"
+scenario rf_sig_not_exact "live" "checksig output has 'signatures OK' only inside a path: codecs skipped"
 sc_rf_sig_not_exact() {
     fx_conf FKS_CHECKSIG=notexact
     invoke --yes --no-reboot
     rf_refused 'Signature check failed for the RPM Fusion free release package'
 }
 
-scenario rf_sig_rc "live" "checksig prints 'digests signatures OK' but exits non-zero: dies"
+scenario rf_sig_rc "live" "checksig prints 'digests signatures OK' but exits non-zero: codecs skipped"
 sc_rf_sig_rc() {
     fx_conf FKS_CHECKSIG=okfail
     invoke --yes --no-reboot
     rf_refused 'Signature check failed for the RPM Fusion free release package'
 }
 
-scenario rf_wrong_package "live" "Signed file is another package (rpm -qp name mismatch): dies"
+scenario rf_wrong_package "live" "Signed file is another package (rpm -qp name mismatch): codecs skipped"
 sc_rf_wrong_package() {
     fx_conf FKS_RPM_QP_NAME=evil-package
     invoke --yes --no-reboot
@@ -1949,7 +2054,7 @@ sc_user_valid_names() {
         invoke --user "$u" --yes
         expect_rc 0
         expect_no_out "isn't a valid user name"
-        expect_out_fixed "cleaning up for user '$u'"
+        expect_out_fixed "user '$u'"
     done
 }
 
@@ -1958,4 +2063,708 @@ sc_user_digits() {
     invoke --user 123 --yes --no-reboot
     expect_out_fixed "'123' isn't a valid user name"
     if is_live; then expect_untouched; else expect_rc 0; fi
+}
+
+# ===========================================================================
+# v1.2: choosing steps, status detection, progress, reboot advice
+
+# Menu sessions run on a pty without --all/--only. Base machine = Intel laptop, where the
+# step numbers are: 1 dnf, 2 update, 3 codecs, 4 drivers (n/a), 5 pim, 6 libreoffice,
+# 7 flathub, 8 firmware, 9 maintenance.
+menu_machine() { fx_gpu_intel; fx_wifi_intel; fx_wifi_phy 0000:00:14.3; fx_battery; }
+
+expect_menu_shown() {
+    expect_out 'Already done: [0-9]+   Partly done: [0-9]+   Not done yet: [0-9]+$'
+    expect_out_fixed '[✔] already done   [◐] partly done   [ ] not done yet   [x] selected'
+    expect_out_fixed 'Type numbers to select/unselect (e.g. "1 3 5"; selecting a [✔] step redoes it), r = all recommended not done yet,'
+    expect_out_fixed 'a = everything not done yet, n = none, Enter = continue, q = quit'
+}
+
+expect_nothing_changed() {  # menu left without running anything
+    expect_no_pkg_change
+    expect_no_call '^systemctl (mask|enable|restart|stop|reboot)'
+    expect_no_file "$(state_file)"
+    expect_no_file "$R/run/fedora-kde-setup.lock"
+    expect_home_intact "$H"
+}
+
+scenario menu_pick "pty" "Menu: pick 1 and 9, Enter, y: only DNF + maintenance run; no rails/network/PackageKit"
+sc_menu_pick() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='1 9\n\ny\n'
+    invoke --no-reboot
+    expect_success
+    expect_menu_shown
+    expect_out '^  1\. \[x\] Faster DNF downloads \[Recommended\]'
+    expect_out '^  9\. \[x\] SSD trim \+ smaller system logs \[Optional\]'
+    expect_will_do '1. Faster DNF downloads'
+    expect_will_do '2. SSD trim + smaller system logs'
+    expect_no_will_do 'Full system update'
+    expect_out 'Proceed\? \[y/N\]'
+    expect_no_call '^dnf5 upgrade'
+    expect_no_call '^df '
+    expect_no_call '^curl'
+    expect_no_call '^systemctl mask'
+    expect_file "$R/run/fedora-kde-setup.lock"
+    expect_recorded dnf
+    expect_recorded maintenance
+    expect_count "$(state_file)" . 2
+    expect_out_fixed 'No reboot needed.'
+    expect_no_out 'Reboot now'
+}
+
+scenario menu_recommended "pty" "Menu: r picks the recommended steps not done yet; n at Proceed aborts"
+sc_menu_recommended() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='r\n\nn\n'
+    invoke --no-reboot
+    expect_rc 1
+    local t
+    for t in "Faster DNF downloads" "Full system update" "Media codecs and video acceleration" \
+        "Flathub as Discover's app store" "Firmware updates"; do expect_will_do "$t"; done
+    for t in "Remove KDE PIM" "Remove LibreOffice" "SSD trim" "Drivers"; do expect_no_will_do "$t"; done
+    expect_out 'Aborted, nothing was changed'
+    expect_nothing_changed
+}
+
+scenario menu_everything "pty" "Menu: a picks everything not done yet (incl. optional)"
+sc_menu_everything() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='a\n\nn\n'
+    invoke --no-reboot
+    local t
+    for t in "Faster DNF downloads" "Full system update" "Media codecs" "Remove KDE PIM" \
+        "Remove LibreOffice" "Flathub" "Firmware updates" "SSD trim"; do expect_will_do "$t"; done
+    expect_no_will_do 'Drivers'
+    expect_nothing_changed
+}
+
+scenario menu_none_enter_quit "pty" "Menu: r, then n, Enter with nothing selected re-asks; q quits with exit 0"
+sc_menu_none_enter_quit() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='r\nn\n\nq\n'
+    invoke --no-reboot
+    expect_rc 0
+    expect_out_fixed 'Nothing selected yet: type the numbers of the steps you want (or r for the recommended ones).'
+    expect_out '^Nothing was changed\.$'
+    expect_no_out 'Will do:'
+    expect_nothing_changed
+}
+
+scenario menu_invalid_input "pty" "Menu: bad tokens and an n/a step give hints, menu stays"
+sc_menu_invalid_input() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='x 42 4 1.5\nq\n'
+    invoke --no-reboot
+    expect_rc 0
+    expect_out_fixed '"x" isn'"'"'t a step number between 1 and 9.'
+    expect_out_fixed '"42" isn'"'"'t a step number between 1 and 9.'
+    expect_out_fixed '"1.5" isn'"'"'t a step number between 1 and 9.'
+    expect_out_fixed "Step 4 isn't available: nothing needed: your graphics and Wi-Fi use built-in drivers."
+    expect_nothing_changed
+}
+
+scenario menu_quit "pty" "Menu: q right away: exit 0, nothing changed, no lock"
+sc_menu_quit() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='q\n'
+    invoke --no-reboot
+    expect_rc 0
+    expect_menu_shown
+    expect_out '^Nothing was changed\.$'
+    expect_nothing_changed
+}
+
+scenario menu_eof "pty" "Menu: input closed (Ctrl-D): aborted, nothing changed"
+sc_menu_eof() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT=''
+    invoke --no-reboot
+    expect_rc 1
+    expect_out 'Aborted, nothing was changed'
+    expect_nothing_changed
+}
+
+scenario menu_decimal "pty" "Menu: 08 and 09 are decimal step numbers (no octal error)"
+sc_menu_decimal() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='08 09\n\nn\n'
+    invoke --no-reboot
+    expect_will_do '1. Firmware updates'
+    expect_will_do '2. SSD trim + smaller system logs'
+    expect_no_out 'value too great for base'
+    expect_no_out "isn't a step number"
+    expect_nothing_changed
+}
+
+scenario menu_toggle_off "pty" "Menu: selecting a step twice unselects it"
+sc_menu_toggle_off() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='1\n1\n\nq\n'
+    invoke --no-reboot
+    expect_rc 0
+    expect_out '^  1\. \[x\] Faster DNF downloads'
+    expect_out_fixed 'Nothing selected yet'
+    expect_nothing_changed
+}
+
+scenario menu_redo_done "pty" "Menu: a done step shows [✔]; selecting it redoes it"
+sc_menu_redo_done() {
+    AUTO_ALL=0
+    menu_machine
+    printf '[main]\nfastestmirror=True\nmax_parallel_downloads=10\ndefaultyes=True\n' > "$R/etc/dnf/dnf.conf"
+    cp "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
+    PTY_INPUT='1\n\ny\n'
+    invoke --no-reboot
+    expect_success
+    expect_out '^  1\. \[✔\] Faster DNF downloads \[Recommended\]  ✔ already set$'
+    expect_out '^  1\. \[x\] Faster DNF downloads'
+    expect_will_do '1. Faster DNF downloads'
+    expect_out 'fastestmirror is already set'
+    expect_out 'Kept your max_parallel_downloads=10'
+    check "dnf.conf byte-identical after redo" cmp -s "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
+    expect_recorded dnf
+}
+
+scenario menu_auto_update "pty" "Menu: drivers auto-selects the update; unticking the update is refused"
+sc_menu_auto_update() {
+    AUTO_ALL=0
+    fx_gpu_nvidia "${NV_TU106[@]}"
+    PTY_INPUT='4\n2\n\nn\n'
+    invoke --no-reboot
+    expect_out '^  2\. \[x\] Full system update \[Recommended\]  • 3 updates available \(needed by Drivers\)$'
+    expect_out_fixed 'Step 2 is needed by the drivers step; untick that one first.'
+    expect_will_do 'Full system update  (needed by Drivers)'
+    expect_will_do 'Drivers: NVIDIA GeForce RTX 2060 Rev. A'
+    expect_nothing_changed
+}
+
+scenario menu_untick_drivers "pty" "Menu: unticking drivers also drops the auto-selected update"
+sc_menu_untick_drivers() {
+    AUTO_ALL=0
+    fx_gpu_nvidia "${NV_TU106[@]}"
+    PTY_INPUT='4\n4\n\nq\n'
+    invoke --no-reboot
+    expect_rc 0
+    expect_out_fixed 'Nothing selected yet'
+    expect_nothing_changed
+}
+
+scenario menu_leftover "pty" "Menu: leftover PIM data is never picked by a/r; picking 5 cleans it"
+sc_menu_leftover() {
+    AUTO_ALL=0
+    menu_machine
+    fx_del installed "${FX_PIM[@]}"
+    PTY_INPUT='a\n\nn\n'
+    invoke --no-reboot
+    expect_out '^  5\. \[◐\] Remove leftover KDE PIM data \[Optional\]  ◐ partly done: app removed, data still in your home folder$'
+    expect_no_will_do 'Remove leftover KDE PIM data'
+    expect_nothing_changed
+    PTY_INPUT='5\n\ny\n'
+    invoke --no-reboot
+    expect_success
+    expect_will_do '1. Remove leftover KDE PIM data'
+    expect_deleted "$H" "${FX_PIM_JUNK[@]}"
+    expect_kept "$H" "${FX_OFFICE_JUNK[@]}"
+    expect_recorded pim
+}
+
+scenario menu_full_run "pty" "Menu: r + 9, run everything picked, decline the reboot"
+sc_menu_full_run() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='r 9\n\ny\nn\n'
+    invoke
+    expect_success
+    expect_out 'Reboot now\? \(recommended\) \[Y/n\]'
+    expect_out_fixed 'OK. Remember to reboot soon.'
+    expect_no_call '^systemctl reboot'
+    expect_out 'Finished: 6 of 6 steps done'
+}
+
+# --- Choosing steps with flags --------------------------------------------------
+
+scenario only_libreoffice "live" "--only libreoffice: LibreOffice removed; PIM, update, RPM Fusion, network untouched"
+sc_only_libreoffice() {
+    invoke --only libreoffice --yes --no-reboot
+    expect_success
+    expect_will_do '1. Remove LibreOffice'
+    expect_action "^dnf5 remove -y $OFFICE_SORTED$"
+    expect_no_action "^dnf5 remove -y $PIM_SORTED$"
+    expect_no_call '^dnf5 upgrade|^curl|^rpmkeys'
+    expect_deleted "$H" "${FX_OFFICE_JUNK[@]}"
+    expect_kept "$H" "${FX_PIM_JUNK[@]}"
+    expect_recorded libreoffice
+    expect_count "$(state_file)" . 1
+    expect_call '^df -Pm'
+}
+
+scenario only_codecs "live" "--only codecs: bootstraps RPM Fusion (network probe), no system upgrade"
+sc_only_codecs() {
+    invoke --only codecs --yes --no-reboot
+    expect_success
+    expect_call_line "$CURL_HEAD $(rf_url free 41)"
+    expect_rpmfusion 41
+    expect_no_call '^dnf5 upgrade --refresh'
+    expect_recorded codecs
+}
+
+scenario only_pim "live" "--only pim: no network check at all"
+sc_only_pim() {
+    invoke --only pim --yes --no-reboot
+    expect_success
+    expect_no_call '^curl'
+    expect_action "^dnf5 remove -y $PIM_SORTED$"
+    expect_no_action "^dnf5 remove -y $OFFICE_SORTED$"
+    expect_recorded pim
+}
+
+scenario only_dnf "live" "--only dnf: no rails, no PackageKit pause, no network; lock still taken"
+sc_only_dnf() {
+    invoke --only=dnf --yes --no-reboot
+    expect_success
+    expect_no_call '^df |^pgrep -x|^rpm -q --quiet rpm$|^curl|^systemctl mask|^dnf5 history'
+    expect_file "$R/run/fedora-kde-setup.lock"
+    expect_recorded dnf
+    expect_out_fixed 'No reboot needed.'
+}
+
+scenario skip_steps "live" "--all --skip pim,libreoffice: both left alone"
+sc_skip_steps() {
+    invoke --all --skip pim,libreoffice --yes --no-reboot
+    expect_success
+    expect_no_will_do 'Remove'
+    expect_no_action '^dnf5 remove -y'
+    expect_home_intact "$H"
+    expect_recorded maintenance
+    expect_not_recorded pim
+}
+
+scenario skip_update_drivers "live" "--all --skip update with NVIDIA: drivers dropped (they need the update)"
+sc_skip_update_drivers() {
+    fx_gpu_nvidia "${NV_TU106[@]}"
+    invoke --all --skip update --yes --no-reboot
+    expect_success
+    expect_out_fixed 'Skipped the drivers: they need the system update, which --skip leaves out'
+    expect_no_will_do 'Full system update'
+    expect_no_will_do 'Drivers'
+    expect_no_call '^dnf5 upgrade --refresh'
+    expect_no_action 'akmod-nvidia'
+}
+
+scenario only_drivers_dep "dry" "--only drivers with pending updates: update added '(needed by Drivers)'"
+sc_only_drivers_dep() {
+    fx_gpu_nvidia "${NV_TU106[@]}"
+    invoke --only drivers --yes
+    expect_success
+    expect_will_do '1. Full system update  (needed by Drivers)'
+    expect_will_do '2. Drivers: NVIDIA GeForce RTX 2060 Rev. A'
+}
+
+scenario flag_errors "dry" "--skip without --all, --only with --all, unknown/empty step IDs: rejected"
+sc_flag_errors() {
+    EXPECT_NO_LOG=1
+    invoke --only pim --skip dnf
+    expect_rc 1
+    expect_out_fixed -- '--skip only works together with --all'
+    invoke --only pim --all
+    expect_rc 1
+    expect_out_fixed 'Use either --only or --all, not both'
+    invoke --only dnf,foo
+    expect_rc 1
+    expect_out_fixed "Unknown step 'foo' in --only. Valid steps: dnf update codecs drivers pim libreoffice flathub firmware maintenance"
+    invoke --all --skip bar
+    expect_rc 1
+    expect_out_fixed "Unknown step 'bar' in --skip."
+    invoke --only ''
+    expect_rc 1
+    expect_out_fixed -- '--only needs a list of steps (see --list-steps)'
+    check "no command called" not test -s "$CALLS"
+}
+
+scenario yes_without_selection "live" "--yes without --only/--all: refused, nothing changed"
+sc_yes_without_selection() {
+    AUTO_ALL=0
+    invoke --yes --no-reboot
+    expect_untouched
+    expect_out_fixed 'Choose steps with --only ... or --all (see --list-steps). Nothing was changed.'
+}
+
+scenario notty_no_flags "dry live" "No terminal, no flags: real run refuses; dry run previews all not-done steps"
+sc_notty_no_flags() {
+    AUTO_ALL=0
+    invoke --no-reboot
+    if is_live; then
+        expect_untouched
+        expect_out_fixed 'No terminal to show the checklist on. Choose steps with --only ... or --all, plus --yes.'
+    else
+        expect_success
+        expect_out_fixed "No terminal for the checklist: previewing every step that isn't done yet"
+        expect_will_do 'Full system update'
+        expect_will_do 'SSD trim'
+    fi
+}
+
+scenario list_steps "dry" "--list-steps prints IDs, titles, tags and reasons; runs nothing"
+sc_list_steps() {
+    EXPECT_NO_LOG=1
+    invoke --list-steps
+    expect_rc 0
+    expect_out '^Steps \(use the IDs with --only, --skip\):$'
+    expect_out "^  dnf +Faster DNF downloads \\[Recommended\\]$"
+    expect_out "^  pim +Remove KDE PIM \\(KMail, Kontact, KOrganizer\\.\\.\\.\\) \\[Optional\\]$"
+    expect_out "^  maintenance +SSD trim \\+ smaller system logs \\[Optional\\]$"
+    expect_out 'Picks the fastest mirror and downloads 10 files at once'
+    check "no command called" not test -s "$CALLS"
+}
+
+scenario nothing_to_do "live" "Fully set-up VM + --all: 'Nothing to do', nothing changed"
+sc_nothing_to_do() {
+    fx_fully_configured
+    cp "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
+    invoke --all --yes --no-reboot
+    expect_rc 0
+    expect_out_fixed 'Nothing to do: the selected steps are already done (--force runs them again).'
+    expect_no_pkg_change
+    expect_no_call '^systemctl (mask|enable|restart)'
+    expect_no_file "$(state_file)"
+    check "dnf.conf unchanged" cmp -s "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
+}
+
+scenario force_rerun "live" "Fully set-up VM + --all --force: every applicable step reruns, no needless reboot"
+sc_force_rerun() {
+    fx_fully_configured
+    cp "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
+    invoke --all --force --yes --no-reboot
+    expect_success
+    local t
+    for t in "Faster DNF downloads" "Full system update" "Media codecs" "Guest tools for this virtual machine (kvm)" \
+        "Remove KDE PIM" "Remove LibreOffice" "Flathub" "SSD trim"; do expect_will_do "$t"; done
+    expect_no_will_do 'Firmware'
+    check "dnf.conf byte-identical (values already set)" cmp -s "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
+    expect_out 'fastestmirror is already set'
+    expect_out 'RPM Fusion already installed'
+    expect_out 'KDE PIM is not installed'
+    # Nothing was pending, so the upgrade changed nothing: no reboot advice from it.
+    expect_out_fixed 'No reboot needed.'
+    expect_out 'Finished: 8 of 8 steps done'
+}
+
+scenario only_done_skipped "live" "--only with an already-done step: listed under Skipped"
+sc_only_done_skipped() {
+    printf '[main]\nfastestmirror=True\nmax_parallel_downloads=10\ndefaultyes=True\n' > "$R/etc/dnf/dnf.conf"
+    invoke --only dnf,maintenance --yes --no-reboot
+    expect_success
+    expect_out 'Skipped:'
+    expect_out_fixed 'Faster DNF downloads (already done; --force runs it again)'
+    expect_not_recorded dnf
+    expect_recorded maintenance
+}
+
+scenario only_not_applicable "live" "--only firmware in a VM: says it doesn't apply, not that it's 'already done'"
+sc_only_not_applicable() {
+    fx_conf FKS_VIRT=kvm
+    invoke --only firmware --yes --no-reboot
+    expect_rc 0
+    expect_out_fixed 'Skipping Firmware updates: not available in a virtual machine'
+    expect_no_out 'already done'
+    expect_no_pkg_change
+}
+
+scenario akmods_already_built "live" "Modules already built for the newest kernel: no akmods/kernel-devel, reboot still advised"
+sc_akmods_already_built() {
+    fx_gpu_nvidia "${NV_TU106[@]}"
+    fx_conf FKS_UPDATES=0
+    fx_add modules "$FX_KERNEL nvidia"
+    invoke --only drivers --yes --no-reboot
+    expect_success
+    expect_no_will_do 'Full system update'
+    expect_out "Kernel modules \\(nvidia\\) already built for $FX_KERNEL"
+    expect_no_call '^akmods'
+    expect_no_action 'kernel-devel'
+    expect_out_fixed 'A reboot is recommended to load the new drivers.'
+    expect_recorded drivers
+}
+
+scenario akmods_built_loaded "live" "Driver reinstalled, module built and loaded: no reboot needed"
+sc_akmods_built_loaded() {
+    fx_gpu_nvidia "${NV_TU106[@]}"
+    fx_conf FKS_UPDATES=0
+    fx_add modules "$FX_KERNEL nvidia"
+    mkdir -p "$R/sys/module/nvidia"
+    invoke --only drivers --yes --no-reboot
+    expect_success
+    expect_no_call '^akmods'
+    expect_out_fixed 'No reboot needed.'
+}
+
+scenario dnfconf_keep_higher "live" "dnf.conf: keeps max_parallel_downloads=20 and an existing true value"
+sc_dnfconf_keep_higher() {
+    printf '[main]\nfastestmirror=1\nmax_parallel_downloads=20\n' > "$R/etc/dnf/dnf.conf"
+    invoke --status
+    expect_out 'Faster DNF downloads \[Recommended\]  ◐ partly done: some settings missing'
+    invoke --only dnf --yes --no-reboot
+    expect_success
+    expect_out 'fastestmirror is already set'
+    expect_out 'Kept your max_parallel_downloads=20'
+    expect_count "$R/etc/dnf/dnf.conf" '^max_parallel_downloads=20$' 1
+    expect_count "$R/etc/dnf/dnf.conf" '^fastestmirror=1$' 1
+    expect_count "$R/etc/dnf/dnf.conf" '^defaultyes=True$' 1
+    expect_no_out 'set max_parallel_downloads'
+}
+
+# --- Status detection ------------------------------------------------------------
+
+expect_status_line() {  # NUMBER BOX TITLE_RE [BADGE_RE]
+    expect_out "^  $1\\. \\[$2\\] $3 \\[(Recommended|Optional)\\]  ${4:-}\$"
+}
+
+status_unchanged_checks() {
+    expect_rc 0
+    expect_out_fixed 'Nothing was changed. Run without --status to pick steps.'
+    expect_no_pkg_change
+    expect_no_call '^systemctl (mask|enable|restart|stop)|^curl|^df '
+    expect_no_file "$R/run/fedora-kde-setup.lock"
+    expect_no_out 'Will do:'
+}
+
+scenario status_fresh "live user" "--status on a fresh laptop: todo/partial/n-a badges; no changes; works without root"
+sc_status_fresh() {
+    menu_machine
+    local before
+    before=$(tree_state "$R" "$T/home")
+    invoke --status
+    status_unchanged_checks
+    check "fake root and homes unchanged by --status" test "$before" == "$(tree_state "$R" "$T/home")"
+    expect_out 'Already done: 0   Partly done: 1   Not done yet: 7$'
+    expect_status_line 1 ' ' 'Faster DNF downloads'
+    expect_status_line 2 ' ' 'Full system update' '• 3 updates available'
+    expect_status_line 3 ' ' 'Media codecs and video acceleration'
+    expect_out_fixed '  4. [-] Drivers for your hardware: nothing needed: your graphics and Wi-Fi use built-in drivers'
+    expect_status_line 5 ' ' 'Remove KDE PIM \(KMail, Kontact, KOrganizer\.\.\.\)' '• currently installed'
+    expect_status_line 6 ' ' 'Remove LibreOffice' '• currently installed'
+    expect_status_line 7 '◐' "Flathub as Discover's app store" \
+        "◐ partly done: missing Flathub, Fedora's duplicate Flatpak source disabled, Flathub as Discover's default"
+    expect_status_line 8 ' ' 'Firmware updates' '• not checked yet'
+    expect_status_line 9 ' ' 'SSD trim \+ smaller system logs'
+    if [[ $MODE == user ]]; then
+        expect_no_out 'Run this with sudo'
+        expect_call '^dnf5 -q check-upgrade$'
+    else
+        expect_call '^dnf5 -q check-upgrade --refresh$'
+    fi
+}
+
+scenario status_configured "live" "--status on a fully set-up VM: everything [✔], firmware n/a"
+sc_status_configured() {
+    fx_fully_configured
+    invoke --status
+    status_unchanged_checks
+    expect_out 'Already done: 8   Partly done: 0   Not done yet: 0$'
+    expect_status_line 1 '✔' 'Faster DNF downloads' '✔ already set'
+    expect_status_line 2 '✔' 'Full system update' '✔ up to date'
+    expect_status_line 3 '✔' 'Media codecs and video acceleration' '✔ installed'
+    expect_status_line 4 '✔' 'Guest tools for this virtual machine \(kvm\)' '✔ installed'
+    expect_status_line 5 '✔' 'Remove KDE PIM \(KMail, Kontact, KOrganizer\.\.\.\)' '✔ already removed'
+    expect_status_line 7 '✔' "Flathub as Discover's app store" '✔ already set up'
+    expect_out_fixed '  8. [-] Firmware updates: not available in a virtual machine'
+    expect_status_line 9 '✔' 'SSD trim \+ smaller system logs' '✔ already set up'
+}
+
+scenario status_partial "live" "--status with half-done steps: partial notes for each kind"
+sc_status_partial() {
+    fx_gpu_nvidia "${NV_TU106[@]}"
+    fx_conf FKS_CHECK_UPGRADE_RC=1
+    printf '[main]\nfastestmirror=True\n' > "$R/etc/dnf/dnf.conf"
+    fx_add installed rpmfusion-free-release rpmfusion-nonfree-release akmod-nvidia
+    fx_add modules "$FX_KERNEL nvidia"
+    fx_del installed "${FX_PIM[@]}" "${FX_OFFICE[@]}"
+    rm -rf "${FX_OFFICE_JUNK[@]/#/$H/}"
+    printf '[core]\n[remote "fedora"]\nxa.disable=true\n[remote "flathub"]\nurl=x\nxa.filter=/usr/share/flatpak/fedora-flathub.filter\n' \
+        > "$R/var/lib/flatpak/repo/config"
+    mkdir -p "$H/.config"; printf '[ResourcesModel]\ncurrentApplicationBackend=flatpak-backend\n' > "$H/.config/discoverrc"
+    mkdir -p "$R/etc/systemd/journald.conf.d" "$R/var/lib/fedora-kde-setup"
+    printf '[Journal]\nSystemMaxUse=500M\n' > "$R/etc/systemd/journald.conf.d/00-size.conf"
+    printf 'firmware 2026-03-04 05:06:07\n' > "$(state_file)"
+    invoke --status
+    status_unchanged_checks
+    expect_out 'Already done: 1   Partly done: 6   Not done yet: 2$'
+    expect_status_line 1 '◐' 'Faster DNF downloads' '◐ partly done: some settings missing'
+    expect_status_line 2 ' ' 'Full system update' "• couldn't check for updates"
+    expect_status_line 3 '◐' 'Media codecs and video acceleration' \
+        '◐ partly done: missing ffmpeg, gstreamer1-plugins-bad-freeworld, gstreamer1-plugins-ugly and 2 more'
+    expect_status_line 4 '◐' 'Drivers: NVIDIA GeForce RTX 2060 Rev\. A' '◐ partly done: missing a reboot to load it'
+    expect_status_line 5 '◐' 'Remove leftover KDE PIM data' '◐ partly done: app removed, data still in your home folder'
+    expect_status_line 6 '✔' 'Remove LibreOffice' '✔ already removed'
+    expect_status_line 7 '◐' "Flathub as Discover's app store" '◐ partly done: missing the full \(unfiltered\) Flathub'
+    expect_status_line 8 ' ' 'Firmware updates' '• last checked 2026-03-04'
+    expect_status_line 9 '◐' 'SSD trim \+ smaller system logs' '◐ partly done: partly set up'
+}
+
+scenario status_drivers "live" "--status drivers: not installed / module missing / not loaded (+SB) / loaded"
+sc_status_drivers() {
+    fx_gpu_nvidia "${NV_TU106[@]}"
+    fx_conf FKS_SB=enabled
+    invoke --status
+    expect_status_line 4 ' ' 'Drivers: NVIDIA GeForce RTX 2060 Rev\. A'
+    fx_add installed akmod-nvidia
+    invoke --status
+    expect_status_line 4 '◐' 'Drivers: NVIDIA .*' '◐ partly done: missing nvidia module for the running kernel'
+    fx_add modules "$FX_KERNEL nvidia"
+    invoke --status
+    expect_status_line 4 '◐' 'Drivers: NVIDIA .*' '◐ partly done: missing a reboot to load it \(and Secure Boot key enrollment\)'
+    mkdir -p "$R/sys/module/nvidia"
+    invoke --status
+    expect_status_line 4 '✔' 'Drivers: NVIDIA .*' '✔ installed'
+}
+
+scenario status_flathub "live" "--status flathub: disabled remote, Fedora remote still used, Discover default"
+sc_status_flathub() {
+    mkdir -p "$H/.config"; printf '[ResourcesModel]\ncurrentApplicationBackend=flatpak-backend\n' > "$H/.config/discoverrc"
+    printf '[remote "fedora"]\nurl=oci\n[remote "flathub"]\nurl=x\nxa.disable=true\n' > "$R/var/lib/flatpak/repo/config"
+    invoke --status
+    expect_status_line 7 '◐' "Flathub as Discover's app store" "◐ partly done: missing Flathub enabled, Fedora's duplicate Flatpak source disabled"
+    # Apps installed from Fedora's remote: it may stay enabled.
+    printf '[remote "fedora"]\nurl=oci\n[remote "flathub"]\nurl=x\n' > "$R/var/lib/flatpak/repo/config"
+    fx_add flatpak_origins fedora
+    invoke --status
+    expect_status_line 7 '✔' "Flathub as Discover's app store" '✔ already set up'
+    rm -f "$H/.config/discoverrc"
+    invoke --status
+    expect_status_line 7 '◐' "Flathub as Discover's app store" "◐ partly done: missing Flathub as Discover's default"
+}
+
+scenario status_container "live" "--status in a container: drivers/firmware n/a, fstrim counts as done"
+sc_status_container() {
+    touch "$R/run/.containerenv"
+    mkdir -p "$R/etc/systemd/journald.conf.d"
+    printf '[Journal]\nSystemMaxUse=500M\n' > "$R/etc/systemd/journald.conf.d/00-size.conf"
+    invoke --status
+    status_unchanged_checks
+    expect_out_fixed '  4. [-] Drivers for your hardware: not needed in a container'
+    expect_out_fixed '  8. [-] Firmware updates: not available in a container'
+    expect_status_line 9 '✔' 'SSD trim \+ smaller system logs' '✔ already set up'
+}
+
+scenario status_after_run "live" "After --all, --status shows the done steps as [✔]"
+sc_status_after_run() {
+    menu_machine
+    invoke --all --yes --no-reboot
+    expect_success
+    invoke --status
+    expect_status_line 1 '✔' 'Faster DNF downloads' '✔ already set'
+    expect_status_line 2 '✔' 'Full system update' '✔ up to date'
+    expect_status_line 3 '✔' 'Media codecs and video acceleration' '✔ installed'
+    expect_status_line 5 '✔' 'Remove KDE PIM \(KMail, Kontact, KOrganizer\.\.\.\)' '✔ already removed'
+    expect_status_line 6 '✔' 'Remove LibreOffice' '✔ already removed'
+    expect_status_line 7 '✔' "Flathub as Discover's app store" '✔ already set up'
+    expect_status_line 8 ' ' 'Firmware updates' '• last checked 2026-01-02'
+    expect_status_line 9 '✔' 'SSD trim \+ smaller system logs' '✔ already set up'
+}
+
+# --- Progress and reboot advice ----------------------------------------------------
+
+progress_percents() {  # prints the percentages of the progress lines, in order
+    grep -oE "$1" "$OUT" | grep -oE '[0-9]+%' | tr -d %
+}
+monotonic_to_100() {  # reads numbers: non-decreasing, starts at 0, ends at 100
+    local prev=-1 n first="" last=""
+    while read -r n; do
+        [[ -z $first ]] && first=$n
+        (( n >= prev )) || return 1
+        prev=$n last=$n
+    done
+    [[ $first == 0 && $last == 100 ]]
+}
+
+scenario progress_plain "live" "No terminal: plain '[N%] Step i of n' lines, rising to 100%"
+sc_progress_plain() {
+    menu_machine
+    invoke --all --yes --no-reboot
+    expect_success
+    local i
+    for i in 1 2 3 4 5 6 7 8; do expect_out "^\\[[0-9]+%\\] Step $i of 8: "; done
+    expect_out '^\[0%\] Step 1 of 8: Faster DNF downloads$'
+    expect_out '^\[100%\] Finished: 8 of 8 steps done$'
+    check "percentages rise monotonically from 0 to 100" monotonic_to_100 < <(progress_percents '^\[[0-9]+%\]')
+    check "no bar characters without a terminal" not grep -q '█' "$OUT"
+}
+
+scenario progress_tty "pty" "Terminal: bar lines with percentages, window title updates, ends at 100%"
+sc_progress_tty() {
+    menu_machine
+    invoke --all --yes --no-reboot
+    expect_success
+    expect_out '^\[░{24}\]   0%  Step 1 of 8: Faster DNF downloads$'
+    expect_out '^\[█{24}\] 100%  Finished: 8 of 8 steps done$'
+    check "percentages rise monotonically from 0 to 100" \
+        monotonic_to_100 < <(progress_percents '^\[[█░]{24}\] +[0-9]+%')
+    check "window title set via OSC" grep -q $'\e\\]0;fedora-kde-setup [0-9]*%\a' "$T/raw.txt"
+    check "window title says done at the end" grep -q $'\e\\]0;fedora-kde-setup: done\a' "$T/raw.txt"
+}
+
+scenario reboot_declined "pty" "Reboot advised after the update: prompt shown, 'n' declines"
+sc_reboot_declined() {
+    menu_machine
+    PTY_INPUT='y\nn\n'
+    invoke
+    expect_success
+    expect_out_fixed 'A reboot is recommended so updated system services and libraries are used.'
+    expect_out 'Reboot now\? \(recommended\) \[Y/n\]'
+    expect_out_fixed 'OK. Remember to reboot soon.'
+    expect_no_call '^systemctl reboot'
+}
+
+scenario reboot_eof "pty" "Reboot prompt answered with Ctrl-D (EOF): treated as no, no reboot"
+sc_reboot_eof() {
+    menu_machine
+    PTY_INPUT='y\n'
+    invoke
+    expect_success
+    expect_out 'Reboot now\? \(recommended\) \[Y/n\]'
+    expect_no_call '^systemctl reboot'
+}
+
+scenario reboot_not_needed "pty" "Only DNF + maintenance: 'No reboot needed', no prompt"
+sc_reboot_not_needed() {
+    menu_machine
+    PTY_INPUT='y\n'
+    invoke --only dnf,maintenance
+    expect_success
+    expect_out_fixed 'No reboot needed.'
+    expect_no_out 'Reboot now'
+}
+
+scenario folder_hint "live" "Script run from a folder named fedora-kde-postinstall: suggests deleting it; other names: no hint"
+sc_folder_hint() {
+    mkdir -p "$T/dl/fedora-kde-postinstall" "$T/dl/other"
+    cp "$SCRIPT" "$T/dl/fedora-kde-postinstall/fedora-kde-setup.sh"
+    cp "$SCRIPT" "$T/dl/other/fedora-kde-setup.sh"
+    SCRIPT_UNDER_TEST=$T/dl/fedora-kde-postinstall/fedora-kde-setup.sh
+    invoke --only dnf --yes --no-reboot
+    expect_success
+    expect_out_fixed "After the reboot you can delete the download folder: rm -rf $T/dl/fedora-kde-postinstall"
+    SCRIPT_UNDER_TEST=$T/dl/other/fedora-kde-setup.sh
+    invoke --only maintenance --yes --no-reboot
+    expect_success
+    expect_no_out 'delete the download folder'
+}
+
+scenario folder_hint_dry "dry" "Dry run never suggests deleting the folder"
+sc_folder_hint_dry() {
+    mkdir -p "$T/dl/fedora-kde-postinstall"
+    cp "$SCRIPT" "$T/dl/fedora-kde-postinstall/fedora-kde-setup.sh"
+    SCRIPT_UNDER_TEST=$T/dl/fedora-kde-postinstall/fedora-kde-setup.sh
+    invoke --only dnf --yes
+    expect_success
+    expect_no_out 'delete the download folder'
 }

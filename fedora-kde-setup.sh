@@ -146,6 +146,9 @@ on_error() {
 
 cleanup() {
     local rc=$?
+    if (( ${MENU_ACTIVE:-0} )); then
+        printf '\e[?25h' >/dev/tty 2>/dev/null || true
+    fi
     if (( PK_MASKED )); then
         systemctl unmask --runtime packagekit.service &>/dev/null || true
     fi
@@ -1079,46 +1082,96 @@ tag_label() {  # $1 = step
 
 # $1 = menu | status
 draw_steps() {
-    local mode=$1 i id box n_done=0 n_partial=0 n_todo=0 extra
-    for id in "${ALL_STEPS[@]}"; do
-        applicable "$id" || continue
-        case ${STEP_STATUS[$id]} in
-            done)    n_done=$((n_done + 1)) ;;
-            partial) n_partial=$((n_partial + 1)) ;;
-            *)       n_todo=$((n_todo + 1)) ;;
-        esac
-    done
-    printf '\n  %sAlready done: %d%s   %sPartly done: %d%s   %sNot done yet: %d%s\n' \
-        "$C_GREEN" "$n_done" "$C_RESET" "$C_YELLOW" "$n_partial" "$C_RESET" "$C_CYAN" "$n_todo" "$C_RESET"
-    printf '  %s[✔]%s already done   %s[◐]%s partly done   [ ] not done yet' "$C_GREEN" "$C_RESET" "$C_YELLOW" "$C_RESET"
-    if [[ $mode == menu ]]; then
-        printf '   %s[x]%s selected' "$C_BOLD$C_CYAN" "$C_RESET"
+    print_overview
+    if [[ $1 == status ]]; then
+        local -a items
+        local id
+        mapfile -t items < <(menu_items)
+        printf '\n  %sStill to do%s\n' "$C_BOLD" "$C_RESET"
+        if (( ${#items[@]} == 0 )); then
+            printf '      %snothing: everything that applies is done%s\n' "$C_GREEN" "$C_RESET"
+        fi
+        for id in "${items[@]}"; do
+            printf '      [ ] %s%s%s  %s  %s\n' "$C_BOLD" "${STEP_TITLE[$id]}" "$C_RESET" "$(tag_label "$id")" "$(status_badge "$id")"
+            printf '          %s%s%s\n' "$C_DIM" "${STEP_WHY[$id]}" "$C_RESET"
+        done
     fi
-    printf '\n\n'
-    for i in "${!ALL_STEPS[@]}"; do
-        id=${ALL_STEPS[i]}
+}
+
+# Read-only part of the menu: what's done and what doesn't apply here.
+print_overview() {
+    local id done_ids=() na_ids=()
+    for id in "${ALL_STEPS[@]}"; do
         if ! applicable "$id"; then
-            printf '  %s%d. [-] %s: %s%s\n' "$C_DIM" "$((i + 1))" "${STEP_TITLE[$id]}" "${STEP_NA[$id]}" "$C_RESET"
-            continue
+            na_ids+=("$id")
+        elif [[ ${STEP_STATUS[$id]} == "done" ]]; then
+            done_ids+=("$id")
         fi
-        # Picked steps show [x]; the rest show what's already in place.
-        if [[ $mode == menu && -n ${SELECTED[$id]:-} ]]; then
-            box="${C_BOLD}${C_CYAN}[x]${C_RESET} "
-        else
-            case ${STEP_STATUS[$id]} in
-                done)    box="${C_GREEN}[✔]${C_RESET} " ;;
-                partial) box="${C_YELLOW}[◐]${C_RESET} " ;;
-                *)       box="[ ] " ;;
-            esac
-        fi
-        extra=""
-        if [[ -n ${AUTO_SELECTED[$id]:-} ]]; then
-            extra=" $C_YELLOW(needed by Drivers)$C_RESET"
-        fi
-        printf '  %s%d.%s %s%s%s%s %s  %s%s\n' "$C_BOLD" "$((i + 1))" "$C_RESET" "$box" "$C_BOLD" \
-            "${STEP_TITLE[$id]}" "$C_RESET" "$(tag_label "$id")" "$(status_badge "$id")" "$extra"
-        printf '        %s%s%s\n' "$C_DIM" "${STEP_WHY[$id]}" "$C_RESET"
     done
+    printf '\n  %s✔ Already done on this computer%s\n' "$C_BOLD$C_GREEN" "$C_RESET"
+    if (( ${#done_ids[@]} == 0 )); then
+        printf '      %snothing yet%s\n' "$C_DIM" "$C_RESET"
+    fi
+    for id in "${done_ids[@]}"; do
+        printf '      %s✔%s %s %s(%s)%s\n' "$C_GREEN" "$C_RESET" "${STEP_TITLE[$id]}" "$C_DIM" "${STEP_NOTE[$id]:-done}" "$C_RESET"
+    done
+    if (( ${#na_ids[@]} )); then
+        printf '\n  %s– Not needed on this computer%s\n' "$C_BOLD$C_DIM" "$C_RESET"
+        for id in "${na_ids[@]}"; do
+            printf '      %s%s (%s)%s\n' "$C_DIM" "${STEP_TITLE[$id]}" "${STEP_NA[$id]}" "$C_RESET"
+        done
+    fi
+}
+
+# Steps the user can still choose: applicable and not already done.
+menu_items() {
+    local id
+    for id in "${ALL_STEPS[@]}"; do
+        if applicable "$id" && [[ ${STEP_STATUS[$id]} != "done" ]]; then
+            printf '%s\n' "$id"
+        fi
+    done
+}
+
+draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
+    local cur=$1 msg=$2 i id count box pointer title row
+    shift 2
+    local -a items=("$@")
+    count=$(selected_steps | grep -c . || true)
+    printf '\e[H\e[2J'
+    printf '  %sFedora KDE setup: choose what to do%s\n' "$C_BOLD" "$C_RESET"
+    print_overview
+    printf '\n  %sSelect what to do%s   %s↑/↓ move · Enter/Space select · r recommended · a all · n none · q quit%s\n\n' \
+        "$C_BOLD$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
+    for i in "${!items[@]}"; do
+        id=${items[i]}
+        if [[ -n ${SELECTED[$id]:-} ]]; then box="${C_BOLD}${C_CYAN}[x]${C_RESET}"; else box="[ ]"; fi
+        pointer="  " title="${C_BOLD}${STEP_TITLE[$id]}${C_RESET}"
+        if (( i == cur )); then
+            pointer="${C_BOLD}${C_CYAN}❯${C_RESET} " title=$'\e[7m'"${C_BOLD} ${STEP_TITLE[$id]} ${C_RESET}"
+        fi
+        row="  $pointer$box $title  $(tag_label "$id")  $(status_badge "$id")"
+        if [[ -n ${AUTO_SELECTED[$id]:-} ]]; then
+            row+="  ${C_YELLOW}(needed by Drivers)${C_RESET}"
+        fi
+        printf '%s\n' "$row"
+        printf '          %s%s%s\n' "$C_DIM" "${STEP_WHY[$id]}" "$C_RESET"
+    done
+    printf '\n'
+    i=${#items[@]}
+    if (( cur == i )); then
+        printf '  %s❯%s \e[7m%s ▶ Continue with %d selected step%s %s\n' "$C_BOLD$C_CYAN" "$C_RESET" "$C_BOLD" "$count" "$( ((count == 1)) || echo s)" "$C_RESET"
+    else
+        printf '      %s▶ Continue with %d selected step%s%s\n' "$C_GREEN" "$count" "$( ((count == 1)) || echo s)" "$C_RESET"
+    fi
+    if (( cur == i + 1 )); then
+        printf '  %s❯%s \e[7m%s Quit without changes %s\n' "$C_BOLD$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+    else
+        printf '      Quit without changes\n'
+    fi
+    if [[ -n $msg ]]; then
+        printf '\n  %s%s%s\n' "$C_YELLOW" "$msg" "$C_RESET"
+    fi
 }
 
 print_step_list() {
@@ -1185,61 +1238,70 @@ select_from_flags() {
     fi
 }
 
+MENU_ACTIVE=0
+
 choose_steps_menu() {
-    local line tok id n=${#ALL_STEPS[@]} count
-    local -a toks
+    local -a items
+    mapfile -t items < <(menu_items)
+    if (( ${#items[@]} == 0 )); then
+        print_overview
+        printf '\n  %sEverything that applies to this computer is already done.%s\n' "$C_GREEN" "$C_RESET"
+        printf '  To redo a step anyway: sudo bash %s --only <step> --force   (see --list-steps)\n' "$0"
+        exit 0
+    fi
+    local cur=0 n=$(( ${#items[@]} + 2 )) key rest msg="" id
+    MENU_ACTIVE=1
+    printf '\e[?25l' >/dev/tty
     while true; do
-        draw_steps menu
-        printf '\n  %sType numbers to select/unselect%s (e.g. "1 3 5"; selecting a [✔] step redoes it), %sr%s = all recommended not done yet,\n  %sa%s = everything not done yet, ' \
-            "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '%sn%s = none, %sEnter%s = continue, %sq%s = quit\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '%s> %s' "$C_BOLD" "$C_RESET"
-        if ! read -r line </dev/tty; then
-            die "Aborted, nothing was changed."
+        draw_menu "$cur" "$msg" "${items[@]}" >/dev/tty
+        msg=""
+        if ! IFS= read -rsn1 key </dev/tty; then
+            key=q
         fi
-        line=${line//,/ }
-        read -ra toks <<<"$line"
-        if (( ${#toks[@]} == 0 )); then
-            count=$(selected_steps | grep -c . || true)
-            if (( count > 0 )); then
-                break
-            fi
-            hint "Nothing selected yet: type the numbers of the steps you want (or r for the recommended ones)."
-            continue
+        if [[ $key == $'\e' ]]; then
+            IFS= read -rsn2 -t 0.1 rest </dev/tty || rest=""
+            key+=$rest
         fi
-        for tok in "${toks[@]}"; do
-            case ${tok,,} in
-                q|quit)
-                    printf '\nNothing was changed.\n'
-                    exit 0 ;;
-                a|all)
-                    for id in "${ALL_STEPS[@]}"; do wants_doing "$id" && select_step "$id"; done ;;
-                r|rec|recommended)
-                    for id in "${ALL_STEPS[@]}"; do
-                        [[ ${STEP_TAG[$id]} == recommended ]] && wants_doing "$id" && select_step "$id"
-                    done ;;
-                n|none)
-                    SELECTED=() AUTO_SELECTED=() ;;
-                *)
-                    if [[ $tok =~ ^[0-9]{1,2}$ ]] && (( 10#$tok >= 1 && 10#$tok <= n )); then
-                        tok=$((10#$tok))
-                        id=${ALL_STEPS[tok - 1]}
-                        if ! applicable "$id"; then
-                            hint "Step $tok isn't available: ${STEP_NA[$id]}."
-                        elif [[ -n ${AUTO_SELECTED[$id]:-} ]]; then
-                            hint "Step $tok is needed by the drivers step; untick that one first."
-                        elif [[ -n ${SELECTED[$id]:-} ]]; then
-                            unset "SELECTED[$id]"
-                        else
-                            select_step "$id"
-                        fi
+        case $key in
+            $'\e[A'|$'\eOA'|k|K)
+                cur=$(( (cur - 1 + n) % n )) ;;
+            $'\e[B'|$'\eOB'|j|J|$'\t')
+                cur=$(( (cur + 1) % n )) ;;
+            ""|" ")
+                if (( cur < ${#items[@]} )); then
+                    id=${items[cur]}
+                    if [[ -n ${AUTO_SELECTED[$id]:-} ]]; then
+                        msg="This step is needed by the drivers step; unselect that one first."
+                    elif [[ -n ${SELECTED[$id]:-} ]]; then
+                        unset "SELECTED[$id]"
                     else
-                        hint "\"$tok\" isn't a step number between 1 and $n."
-                    fi ;;
-            esac
-        done
+                        select_step "$id"
+                    fi
+                elif (( cur == ${#items[@]} )); then
+                    if [[ -n $(selected_steps) ]]; then
+                        break
+                    fi
+                    msg="Select at least one step first: move to it and press Enter or Space."
+                else
+                    key=q
+                fi ;;
+            a|A) for id in "${items[@]}"; do wants_doing "$id" && select_step "$id"; done ;;
+            r|R) for id in "${items[@]}"; do
+                     [[ ${STEP_TAG[$id]} == recommended ]] && wants_doing "$id" && select_step "$id"
+                 done ;;
+            n|N) SELECTED=() AUTO_SELECTED=() ;;
+        esac
+        # q, Esc and Ctrl-D all quit.
+        if [[ $key == q || $key == Q || $key == $'\e' || $key == $'\x04' ]]; then
+            printf '\e[?25h' >/dev/tty
+            MENU_ACTIVE=0
+            printf '\nNothing was changed.\n'
+            exit 0
+        fi
         resolve_dependencies
     done
+    printf '\e[?25h\e[H\e[2J' >/dev/tty
+    MENU_ACTIVE=0
 }
 
 choose_steps() {
