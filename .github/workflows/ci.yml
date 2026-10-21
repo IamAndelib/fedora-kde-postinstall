@@ -22,7 +22,17 @@ jobs:
       - name: shellcheck
         run: shellcheck fedora-kde-setup.sh install.sh tests/*.sh tests/lib/*.sh tests/lib/stub
       - name: Scenario matrix
-        run: bash tests/run.sh
+        run: |
+          set -o pipefail
+          if ! bash tests/run.sh 2>&1 | tee run.log; then
+            # Also show the failures as an annotation on the run's summary page.
+            msg=$( { bash --version | head -n1; sudo --version 2>/dev/null | head -n1; sed -n '/^Failures:/,$p' run.log; } | head -n 120) || true
+            msg=${msg//'%'/'%25'}
+            msg=${msg//$'\r'/}
+            msg=${msg//$'\n'/'%0A'}
+            echo "::error title=Scenario failures::$msg"
+            exit 1
+          fi
 
   fedora:
     name: Real run on Fedora ${{ matrix.release }}
