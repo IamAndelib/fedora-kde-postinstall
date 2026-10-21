@@ -12,10 +12,11 @@
 #   live  real code paths as root, in a private mount namespace, no terminal
 #   pty   like live, on a pseudo-terminal with scripted answers
 #   user  as an unprivileged user
+#   upty  like user, on a pseudo-terminal
 # live/pty need root or passwordless sudo, plus unshare; they are skipped otherwise.
 #
 # Options:
-#   -m, --mode MODES   only run these modes (comma-separated: dry,live,pty,user)
+#   -m, --mode MODES   only run these modes (comma-separated: dry,live,pty,user,upty)
 #   -l, --list         list scenarios and exit
 #   -v, --verbose      print the script output of failing runs
 #   -k, --keep         keep the temp dirs (path printed at the end)
@@ -110,17 +111,18 @@ selected() {  # NAME
     return 1
 }
 
-# The script itself must be shellcheck-clean (skipped if shellcheck isn't installed).
+# The script and its launcher must be shellcheck-clean (skipped if shellcheck isn't installed).
 script_shellcheck() {
-    local out
+    local out files=("$SCRIPT")
+    [[ -f $HERE/../install.sh ]] && files+=("$HERE/../install.sh")
     if ! command -v shellcheck >/dev/null; then
         ROWS+=("script-shellcheck|all|SKIP|-|shellcheck not installed")
         NSKIP=$((NSKIP + 1))
-    elif out=$(shellcheck "$SCRIPT" 2>&1); then
-        ROWS+=("script-shellcheck|all|PASS|1|")
+    elif out=$(shellcheck "${files[@]}" 2>&1); then
+        ROWS+=("script-shellcheck|all|PASS|${#files[@]}|")
         NPASS=$((NPASS + 1))
     else
-        ROWS+=("script-shellcheck|all|FAIL|1|shellcheck reports issues")
+        ROWS+=("script-shellcheck|all|FAIL|${#files[@]}|shellcheck reports issues")
         NFAIL=$((NFAIL + 1))
         DETAILS+=("--- script-shellcheck"$'\n'"    ${out//$'\n'/$'\n'    }")
     fi

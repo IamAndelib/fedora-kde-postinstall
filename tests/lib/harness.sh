@@ -55,6 +55,11 @@ probe_environment() {
             SKIP_WHY[user]="root, and user 'nobody' cannot read the script (or no setpriv)"
         fi
     fi
+    if [[ -z $SCRIPT_BIN ]]; then
+        SKIP_WHY[upty]="util-linux 'script' not installed"
+    elif [[ -n ${SKIP_WHY[user]:-} ]]; then
+        SKIP_WHY[upty]=${SKIP_WHY[user]}
+    fi
     # As root a dry run also writes /var/log, so it needs the same isolation.
     if (( EUID == 0 && !CAN_ROOT )); then
         SKIP_WHY[dry]=${SKIP_WHY[live]}
@@ -147,6 +152,7 @@ release_lock() {
 #   live  as root in a private mount namespace, no controlling terminal
 #   pty   like live, but on a pseudo-terminal fed with $PTY_INPUT
 #   user  as an unprivileged user (the harness user, or nobody when root)
+#   upty  like user, but on a pseudo-terminal fed with $PTY_INPUT
 invoke() {
     local args=("$@") a
     # v1.2 runs nothing unless steps are chosen: scenarios that don't choose get --all.
@@ -205,6 +211,18 @@ invoke() {
             cmdline="$(printf '%q ' "$STTY_BIN" rows "$PTY_ROWS" cols "$PTY_COLS"); $(printf '%q ' "${cmd[@]}")"
             feed_pty_input "$PTY_INPUT" \
                 | ( cd "$T/cwd" && "${isolate[@]}" "$SCRIPT_BIN" -qec "$cmdline" /dev/null ) 2>&1 \
+                | cat > "$T/raw.txt"
+            RC=${PIPESTATUS[1]}
+            ;;
+        upty)
+            local cmdline drop=()
+            cmdline="$(printf '%q ' "$STTY_BIN" rows "$PTY_ROWS" cols "$PTY_COLS"); $(printf '%q ' "${cmd[@]}")"
+            if (( EUID == 0 )); then
+                chmod -R a+rwX "$T"
+                drop=("$SETPRIV_BIN" --reuid=65534 --regid=65534 --clear-groups --)
+            fi
+            feed_pty_input "$PTY_INPUT" \
+                | ( cd "$T/cwd" && "${guard[@]}" "${drop[@]}" "$SCRIPT_BIN" -qec "$cmdline" /dev/null ) 2>&1 \
                 | cat > "$T/raw.txt"
             RC=${PIPESTATUS[1]}
             ;;

@@ -42,6 +42,7 @@ expect_out_fixed()       { check "output contains '$1'" grep -Fq -- "$1" "$OUT";
 expect_no_out_fixed()    { check "output lacks '$1'" not grep -Fq -- "$1" "$OUT"; }
 expect_action_line()     { check "action line '$1'" grep -Fxq -- "$1" "$T/actions"; }
 expect_no_action_line()  { check "no action line '$1'" not grep -Fxq -- "$1" "$T/actions"; }
+glob_matches()           { compgen -G "$1" >/dev/null; }
 expect_call_line()       { check "call line '$1'" grep -Fxq -- "$1" "$CALLS"; }
 expect_no_call_fixed()   { check "no call containing '$1'" not grep -Fq -- "$1" "$CALLS"; }
 count_calls()            { grep -Ec -- "$1" "$CALLS" || true; }
@@ -1617,7 +1618,29 @@ sc_not_root() {
     invoke --dry-run --yes
     expect_rc 0
     expect_out '\(dry-run\) Run this with sudo'
-    check "log written to a mktemp file TMPDIR/fedora-kde-setup.XXXXXX.log" compgen -G "$T/tmp/fedora-kde-setup.??????.log"
+    check "log written to a mktemp file TMPDIR/fedora-kde-setup.XXXXXX.log" glob_matches "$T/tmp/fedora-kde-setup.??????.log"
+    # No terminal: no sudo password prompt, so no re-run through sudo either.
+    expect_no_call '^sudo'
+    expect_no_out 'needs administrator rights'
+}
+
+scenario auto_sudo "upty" "Non-root on a terminal: re-runs itself through sudo with the same arguments"
+sc_auto_sudo() {
+    local script=${SCRIPT_UNDER_TEST:-$SCRIPT}
+    invoke --only codecs --yes
+    expect_rc 0
+    expect_out '^The setup needs administrator rights: enter your password if asked'
+    expect_call_line "sudo bash -- $script --only codecs --yes"
+    check "sudo is the only command run (the script was replaced by it)" test "$(grep -c '' "$CALLS")" -eq 1
+    expect_no_out 'Run this with sudo'
+    # Dry runs and --list-steps need no rights: they never ask.
+    invoke --dry-run --only codecs
+    expect_rc 0
+    expect_no_call '^sudo'
+    expect_no_out 'needs administrator rights'
+    invoke --list-steps
+    expect_rc 0
+    expect_no_call '^sudo'
 }
 
 scenario help "dry" "--help prints usage (also when piped) and does nothing"
@@ -1630,6 +1653,21 @@ sc_help() {
     expect_out '--dry-run'
     expect_out '-V, --version'
     check "no command called" not test -s "$CALLS"
+}
+
+scenario banner "dry live" "Start banner with the version, then 'Checking your system', 'Your hardware', status"
+sc_banner() {
+    invoke --only codecs --yes --no-reboot
+    expect_rc 0
+    # (The harness's own FKS_ROOT warning comes first; a real run starts with the banner.)
+    check "first output line is the banner with the version" \
+        test "$(grep -v '^TEST MODE: ' "$OUT" | grep -m1 .)" == "Fedora KDE post-install setup 1.2.0"
+    expect_out '^Checks your computer, shows what is already done, and lets you choose what to do next\.$'
+    expect_out_before '^Fedora KDE post-install setup ' '^== Checking your system$'
+    expect_out_before '^== Checking your system$' '^== Your hardware$'
+    expect_out_before '^== Your hardware$' "^== Checking what's already done\$"
+    expect_count "$OUT" '^Fedora KDE post-install setup ' 1
+    expect_no_out '^== (Preflight checks|Detecting hardware)$'
 }
 
 scenario version "dry" "-V prints the version"
@@ -2136,7 +2174,7 @@ menu_frames() {  # the text drawn inside the alternate screen, without escape se
     sed -e 's/\x1b\][^\x07]*\x07//g' -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\r$//' <<<"$raw"
 }
 
-max_frame_lines() {  # lines of the tallest menu redraw (between clear-screens)
+max_frame_lines() {  # lines of the tallest menu redraw (newlines between clear-screens)
     local raw frame n max=0
     raw=$(<"$T/raw.txt")
     raw=${raw#*$'\e[?1049h'}
@@ -2144,7 +2182,7 @@ max_frame_lines() {  # lines of the tallest menu redraw (between clear-screens)
     while [[ $raw == *$'\e[H\e[2J'* ]]; do
         raw=${raw#*$'\e[H\e[2J'}
         frame=${raw%%$'\e[H\e[2J'*}
-        n=$(printf '%s' "$frame" | grep -c '')
+        n=$(printf '%s' "$frame" | tr -cd '\n' | wc -c)
         (( n > max )) && max=$n
     done
     echo "$max"
