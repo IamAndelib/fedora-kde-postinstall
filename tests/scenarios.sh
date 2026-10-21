@@ -3120,7 +3120,8 @@ sc_only_not_applicable() {
     invoke --only firmware --yes --no-reboot
     expect_rc 0
     expect_out_fixed 'Skipping Firmware updates: not available in a virtual machine'
-    expect_no_out 'already done'
+    expect_out_fixed "Nothing to do: the selected steps don't apply to this computer."
+    expect_no_out 'steps are already done'
     expect_no_pkg_change
 }
 
