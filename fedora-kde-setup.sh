@@ -122,7 +122,7 @@ MOK_PENDING=0 MOK_PREVIOUS=0 MOK_GENERATED_PASSWORD=""
 NVIDIA_INSTALLED=0 WL_INSTALLED=0 PK_MASKED=0 LOG_PID="" DELETED_COUNT=0 LAST_CMD=""
 HISTORY_START="" WORK_DIR=""
 DRIVERS_NEED_KMOD=0 DRIVERS_WANT_NVIDIA=0 STEP_OK=1
-WARNINGS=() RAN_STEPS=() SKIPPED_STEPS=() FAILED_STEPS=() REBOOT_REASONS=()
+NA_SKIPPED=0 WARNINGS=() RAN_STEPS=() SKIPPED_STEPS=() FAILED_STEPS=() REBOOT_REASONS=()
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -1299,7 +1299,7 @@ menu_row() {  # $1 = step, $2 = highlighted (0/1), $3 = width
     badge=$(trunc "$badge$extra" "$room")
     if (( hl )); then
         plain="> $box $title${badge:+  $badge}"
-        printf '  \e[7m%s%s%s%s\n' "$C_BOLD" "$plain" "$(pad $(( width - 2 - ${#plain} )))" "$C_RESET"
+        printf '  \e[7m%s%s%s\e[0m\n' "$C_BOLD" "$plain" "$(pad $(( width - 2 - ${#plain} )))"
     else
         if [[ $box == "[x]" ]]; then box="${C_BOLD}${C_CYAN}[x]${C_RESET}"; fi
         printf '    %s %s%s%s%s\n' "$box" "$C_BOLD" "$title" "$C_RESET" \
@@ -1327,14 +1327,14 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
     i=${#items[@]}
     if (( cur == i )); then
         line="> ▶ Continue with $count selected step$plural"
-        b_cont="  "$'\e[7m'"$C_BOLD$line$(pad $(( width - 2 - ${#line} )))$C_RESET"
+        b_cont="  "$'\e[7m'"$C_BOLD$line$(pad $(( width - 2 - ${#line} )))"$'\e[0m'
         b_why="Shows a summary of what will happen; nothing changes until you confirm."
     else
         b_cont="    $C_GREEN▶ Continue with $count selected step$plural$C_RESET"
     fi
     if (( cur == i + 1 )); then
         line="> Quit without changes"
-        b_quit="  "$'\e[7m'"$C_BOLD$line$(pad $(( width - 2 - ${#line} )))$C_RESET"
+        b_quit="  "$'\e[7m'"$C_BOLD$line$(pad $(( width - 2 - ${#line} )))"$'\e[0m'
         b_why="Leaves without changing anything."
     else
         b_quit="    Quit without changes"
@@ -1735,6 +1735,7 @@ select_from_flags() {
         for id in "${ONLY_STEPS[@]}"; do
             if ! applicable "$id"; then
                 warn "Skipping ${STEP_TITLE[$id]}: ${STEP_NA[$id]}"
+                NA_SKIPPED=$(( NA_SKIPPED + 1 ))
             elif [[ ${STEP_STATUS[$id]} == "done" ]] && (( ! FORCE )); then
                 SKIPPED_STEPS+=("${STEP_TITLE[$id]} (already done; --force runs it again)")
             else
@@ -2839,7 +2840,13 @@ main() {
 
     choose_steps
     if [[ -z $(selected_steps) ]]; then
-        printf '\nNothing to do: the selected steps are already done (--force runs them again).\n'
+        if (( NA_SKIPPED && ${#SKIPPED_STEPS[@]} )); then
+            printf '\nNothing to do: the selected steps are already done or don'"'"'t apply to this computer.\n'
+        elif (( NA_SKIPPED )); then
+            printf '\nNothing to do: the selected steps don'"'"'t apply to this computer.\n'
+        else
+            printf '\nNothing to do: the selected steps are already done (--force runs them again).\n'
+        fi
         exit 0
     fi
     if [[ -n ${SELECTED[pim]:-}${SELECTED[libreoffice]:-} && -z $TARGET_HOME ]]; then
