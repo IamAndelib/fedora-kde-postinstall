@@ -194,11 +194,17 @@ invoke() {
     local before=""
     if (( IS_DRY )); then before=$(tree_state "$R" "$T/home" "$T/outside"); fi
 
-    # As root the script accepts only a root-owned FKS_ROOT that nobody else can write
-    # to. Under sudo the harness user built it, so hand the top directory to root.
-    if (( ${#ROOTCMD[@]} && !KEEP_ROOT_OWNER )) && [[ $MODE == live || $MODE == pty ]]; then
-        "${ROOTCMD[@]}" chown 0:0 "$R"
-        "${ROOTCMD[@]}" chmod go-w "$R"
+    # As root the script accepts only a FKS_ROOT that is root-owned, like every parent
+    # directory, and not writable by others (sticky dirs are fine). Under sudo the harness
+    # user built the tree, so hand FKS_ROOT to root, and make the scenario dir and the work
+    # dir root-owned sticky dirs like /tmp, which the harness user can still write into.
+    if (( ${#ROOTCMD[@]} )) && [[ $MODE == live || $MODE == pty ]]; then
+        "${ROOTCMD[@]}" chown 0:0 "$T" "$WORK"
+        "${ROOTCMD[@]}" chmod 1777 "$T" "$WORK"
+        if (( !KEEP_ROOT_OWNER )); then
+            "${ROOTCMD[@]}" chown 0:0 "$R"
+            "${ROOTCMD[@]}" chmod go-w "$R"
+        fi
     fi
 
     case $MODE in

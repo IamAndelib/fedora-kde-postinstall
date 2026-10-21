@@ -497,7 +497,12 @@ case $name in
         printf '/dev/vda3              100000 %5d %9d      50%% /\n' 1000 "$free"
         ;;
     rpmkeys)
-        case ${1:-} in
+        # rpmkeys [--dbpath DIR --define MACRO] --import KEY | --checksig -- FILE
+        mode=""
+        for a in "$@"; do
+            case $a in --checksig|--import) mode=$a ;; esac
+        done
+        case $mode in
             --checksig)
                 f=${*: -1}
                 case $FKS_CHECKSIG in
@@ -602,6 +607,6 @@ case $name in
         grep -v "^$key=" "$file" | awk -v g="[$group]" -v kv="$key=$value" '{ print } $0 == g { print kv }' > "$file.new"
         mv "$file.new" "$file"
         ;;
-    sleep|sudo|akonadictl|kbuildsycoca6) ;;
+    sleep|sudo|akonadictl|kbuildsycoca6|rpmdb) ;;
     *) echo "stub: no behaviour defined for '$name'" >&2; exit 127 ;;
 esac

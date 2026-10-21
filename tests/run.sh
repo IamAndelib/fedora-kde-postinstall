@@ -78,7 +78,14 @@ command -v md5sum >/dev/null || { echo "md5sum is required" >&2; exit 2; }
 unset container
 probe_environment
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/fks-tests.XXXXXX")
+# As root the script accepts FKS_ROOT only if it and every parent directory are root-owned
+# and not writable by others (sticky dirs like /tmp are fine). A non-root harness therefore
+# works under /tmp, not a $TMPDIR that may sit in its own (non-root) directory.
+if (( EUID == 0 )); then
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/fks-tests.XXXXXX")
+else
+    WORK=$(mktemp -d /tmp/fks-tests.XXXXXX)
+fi
 chmod 0755 "$WORK"
 SAFEBIN=$WORK/safebin
 safebin_create "$SAFEBIN" || exit 2
@@ -91,7 +98,7 @@ path_guard() {
     stubs_create "$dir/stubs" "$dir/pool"
     for cmd in reboot shutdown poweroff halt systemctl dnf dnf5 yum rpm rpm-ostree mokutil \
             kmodgenca akmods fwupdmgr flatpak sudo su runuser pkill kill killall mount umount \
-            useradd userdel chown dd mkfs curl wget id getent; do
+            useradd userdel chown dd mkfs curl wget id getent rpmkeys rpmdb; do
         path=$(PATH="$dir/stubs:$SAFEBIN" type -P "$cmd") || continue
         [[ $path == "$dir/stubs/$cmd" && $(readlink "$path") == "$FKS_LIB/stub" ]] || bad+=("$cmd=$path")
     done

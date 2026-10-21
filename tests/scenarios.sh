@@ -29,9 +29,6 @@ readonly NV_CURRENT_PKGS="akmod-nvidia xorg-x11-drv-nvidia-cuda xorg-x11-drv-nvi
 readonly NV_580XX_PKGS="akmod-nvidia-580xx xorg-x11-drv-nvidia-580xx-cuda xorg-x11-drv-nvidia-580xx-power libva-nvidia-driver"
 readonly PIM_PROC_RE='^(akonadi|kalendarac|korgac|kontact|kmail|korganizer|kaddressbook|akregator|kalarm|merkuro)'
 
-world_readable_with() {  # FILE TEXT: FILE is readable by others and contains TEXT
-    [[ $(stat -c %A "$1" 2>/dev/null) == ???????r* ]] && grep -qF -- "$2" "$1"
-}
 
 mok_cert() { printf '%s' "$R/etc/pki/akmods/certs/public_key.der"; }
 
@@ -70,16 +67,23 @@ expect_rpmfusion() {  # RELEASE [REPOS...]  (default: free nonfree)
     fi
     # Downloads go to a mktemp dir under FKS_ROOT/tmp, never the caller's TMPDIR.
     wd="$(re_quote "$R/tmp")/fedora-kde-setup\.[A-Za-z0-9]{6}"
+    local own
     for repo in "${repos[@]}"; do
+        # The signature is checked against RPM Fusion's key alone, in a keyring of its own.
+        own="--dbpath $wd/keyring-$repo --define _keyringpath $wd/keyring-$repo/pubkeys/"
         expect_call_line "rpmkeys --import $(rf_key "$repo" "$rel")"
         expect_call "^$(re_quote "$CURL_GET") $wd/rpmfusion-$repo-release\.noarch\.rpm $(re_quote "$(rf_url "$repo" "$rel")")$"
-        expect_call "^rpmkeys --checksig -- $wd/rpmfusion-$repo-release\.noarch\.rpm$"
+        expect_call "^rpmdb $own --initdb$"
+        expect_call "^rpmkeys $own --import $(re_quote "$(rf_key "$repo" "$rel")")$"
+        expect_call "^rpmkeys $own --checksig -- $wd/rpmfusion-$repo-release\.noarch\.rpm$"
+        expect_order "^rpmkeys $own --import" "^rpmkeys $own --checksig"
         expect_call "^rpm -qp --qf %\{NAME\} -- $wd/rpmfusion-$repo-release\.noarch\.rpm$"
         expect_out "RPM Fusion $repo release package signature verified"
         files+=" $wd/rpmfusion-$repo-release\.noarch\.rpm"
     done
     expect_action "^dnf5 install -y$files$"
-    expect_order '^rpmkeys --checksig' '^dnf5 install -y .*/rpmfusion-'
+    expect_no_call '^rpmkeys --checksig'   # never against the system keyring
+    expect_order '^rpmkeys .*--checksig' '^dnf5 install -y .*/rpmfusion-'
 }
 
 readonly STATE=fedora-kde-setup/done
@@ -427,11 +431,21 @@ sc_nvidia_sb_yes_tty() {
     expect_call '^openssl rand -hex 4$'
     expect_call_line "mokutil --import $(mok_cert) --hash-file $R/root/.fedora-kde-setup-mok.hash"
     expect_no_call_line "mokutil --import $(mok_cert)"
-    expect_out 'MOK one-time password: a1b2c3d4'
+    local pwfile=$R/root/fedora-kde-setup-mok-password.txt
+    expect_out_fixed "A one-time MOK password was created and saved in $pwfile; you'll need it on the next boot"
+    expect_out_fixed "Type the one-time password saved in $pwfile (show it: sudo cat $pwfile)"
+    expect_out_fixed 'Your one-time password: a1b2c3d4  (shown only here, not in the log)'
+    expect_password_not_logged a1b2c3d4
     expect_nvidia "$NV_CURRENT_PKGS"
 }
 
-scenario nvidia_sb_notty "live" "Secure Boot on, --yes, no terminal: generated MOK password saved (0600) and shown"
+expect_password_not_logged() {  # PASSWORD: never in the log file (root-only dir: read as root)
+    local log=$R/var/log/fedora-kde-setup.log
+    check "log file exists" rtest -s "$log"
+    check "MOK password '$1' not in the log" not "${ROOTCMD[@]}" grep -qF -- "$1" "$log"
+}
+
+scenario nvidia_sb_notty "live" "Secure Boot on, --yes, no terminal: generated MOK password saved (0600), never printed or logged"
 sc_nvidia_sb_notty() {
     fx_gpu_nvidia "${NV_TU106[@]}"
     fx_conf FKS_SB=enabled
@@ -447,22 +461,25 @@ sc_nvidia_sb_notty() {
     check "MOK password file holds the password" "${ROOTCMD[@]}" grep -qx a1b2c3d4 "$pwfile"
     check "MOK password file is mode 600" test "$("${ROOTCMD[@]}" stat -c %a "$pwfile" 2>/dev/null)" = 600
     check "FKS_ROOT/root created with mode 700" test "$("${ROOTCMD[@]}" stat -c %a "$R/root" 2>/dev/null)" = 700
-    expect_out_fixed "MOK one-time password: a1b2c3d4 (saved in $pwfile); you'll need it on the next boot"
-    expect_out_fixed "this one-time password: a1b2c3d4 (also saved in $pwfile)"
+    expect_out_fixed "A one-time MOK password was created and saved in $pwfile; you'll need it on the next boot"
+    expect_out_fixed "Type the one-time password saved in $pwfile (show it: sudo cat $pwfile)"
+    # No terminal: the password itself is shown nowhere, and never logged.
+    expect_no_out 'a1b2c3d4'
+    expect_no_out 'Your one-time password'
+    expect_password_not_logged a1b2c3d4
     expect_nvidia "$NV_CURRENT_PKGS"
-    # The password file is 0600; the log the same password is printed to must not be
-    # readable by everyone.
-    local log=$R/var/log/fedora-kde-setup.log
-    check "MOK password not exposed in a world-readable log" not world_readable_with "$log" a1b2c3d4
 }
 
-scenario nvidia_sb_enrolled "live" "Secure Boot on, key already enrolled: no MOK import"
+scenario nvidia_sb_enrolled "live" "Secure Boot on, key already enrolled: no MOK import, old password file deleted"
 sc_nvidia_sb_enrolled() {
     fx_gpu_nvidia "${NV_TU106[@]}"
     fx_conf FKS_SB=enabled FKS_MOK_STATE=enrolled
     mkdir -p "$R/etc/pki/akmods/certs"; echo cert > "$(mok_cert)"
+    # A password file left from the run that queued the key: no longer needed.
+    mkdir -p "$R/root"; printf 'feedc0de\n' > "$R/root/fedora-kde-setup-mok-password.txt"
     invoke --yes --no-reboot
     expect_success
+    expect_no_file "$R/root/fedora-kde-setup-mok-password.txt"
     expect_no_call '^kmodgenca'
     expect_out 'akmods signing key already enrolled'
     expect_no_call 'mokutil --import'
@@ -492,7 +509,10 @@ sc_nvidia_sb_pending_saved() {
     invoke --yes --no-reboot
     expect_success
     expect_no_call 'mokutil --(import|generate-hash)'
-    expect_out_fixed "Type this one-time password: feedc0de (also saved in $R/root/fedora-kde-setup-mok-password.txt)"
+    local pwfile=$R/root/fedora-kde-setup-mok-password.txt
+    expect_out_fixed "Type the one-time password saved in $pwfile (show it: sudo cat $pwfile)"
+    expect_no_out 'feedc0de'
+    expect_password_not_logged feedc0de
     expect_no_out 'revoke-import'
 }
 
@@ -694,6 +714,24 @@ sc_broadcom_phy_direct() {
     check "fixture: sysfs device entry is a symlink" test -L "$R/sys/bus/pci/devices/0000:02:00.0"
     expect_no_will_do 'Drivers'
     expect_no_kmods
+}
+
+scenario broadcom_wl_loaded "live" "broadcom-wl installed and loaded (the chip now has a wiphy): drivers done, not 'nothing needed'"
+sc_broadcom_wl_loaded() {
+    fx_gpu_intel; fx_wifi_broadcom 0x43a0 wl
+    fx_wifi_phy 0000:02:00.0
+    fx_add installed rpmfusion-free-release rpmfusion-nonfree-release broadcom-wl akmod-wl
+    fx_add modules "$FX_KERNEL wl"
+    mkdir -p "$R/sys/module/wl"
+    invoke --status
+    expect_rc 0
+    expect_out '^      ✔ Drivers: .*Broadcom.* \(installed\)$'
+    expect_no_out 'nothing needed: your graphics and Wi-Fi use built-in drivers'
+    # Not loaded yet (no reboot since the install): still the drivers step, partly done.
+    rmdir "$R/sys/module/wl"
+    invoke --status
+    expect_out "^      \\[ \\] Drivers: .*Broadcom.*  ◐ partly done: missing a reboot to load it\$"
+    expect_no_out 'nothing needed'
 }
 
 scenario broadcom_brcmfmac "dry live" "BCM4350 (0x43a3, brcmfmac chip) unbound: not a wl chip, no wl"
@@ -1923,6 +1961,26 @@ sc_rf_fail_drivers() {
     expect_not_recorded drivers
 }
 
+scenario codecs_openh264_fails "live" "gstreamer1-plugin-openh264 can't be installed: warning, codecs step not completed"
+sc_codecs_openh264_fails() {
+    fx_add unavailable gstreamer1-plugin-openh264
+    invoke --only codecs --yes --no-reboot
+    expect_rc 0
+    expect_out_fixed "OpenH264 couldn't be installed (Cisco's download server may be down); run the codecs step again later"
+    expect_out_fixed 'Codecs: ffmpeg, GStreamer bad/ugly/libav, LAME'
+    expect_no_out 'OpenH264 \(H\.264 video'
+    expect_not_recorded codecs
+    expect_out 'Not completed \(see warnings\):'
+}
+
+scenario rf_keyring_fails "live" "The private keyring for the signature check can't be set up: codecs skipped"
+sc_rf_keyring_fails() {
+    fx_add fail '^rpmdb '
+    invoke --yes --no-reboot
+    rf_refused "Couldn't set up a keyring to verify the RPM Fusion free release package"
+    expect_no_call '^rpmkeys .*--checksig'
+}
+
 scenario rf_verified "dry live" "Release packages downloaded over HTTPS, signatures checked, installed from local files"
 sc_rf_verified() {
     invoke --yes --no-reboot
@@ -2113,7 +2171,7 @@ sc_mok_rootdir_kept() {
     invoke --yes --no-reboot
     expect_success
     check "existing FKS_ROOT/root keeps mode 755" test "$("${ROOTCMD[@]}" stat -c %a "$R/root")" = 755
-    expect_out 'MOK one-time password: a1b2c3d4'
+    expect_out 'A one-time MOK password was created and saved in '
 }
 
 scenario user_valid_names "dry" "User names John, 2bob and .anna are accepted"
@@ -2950,6 +3008,23 @@ sc_two_steps_fail() {
     expect_recorded dnf
 }
 
+scenario two_steps_fail_reboot "pty" "Two steps not completed on a terminal: summary, then the reboot prompt; exit 0"
+sc_two_steps_fail_reboot() {
+    fx_add unavailable gstreamer1-plugins-bad-freeworld
+    fx_conf FKS_FWUPD_RC=1
+    PTY_INPUT="$START_YES|WAIT:Reboot now|n\\n"
+    invoke --only dnf,update,codecs,firmware
+    expect_rc 0
+    expect_out '^━━ 2 of 4 steps finished; 2 need attention \(see below\)\. ━━$'
+    expect_out 'Not completed \(see warnings\):'
+    expect_out 'Reboot now\? \(recommended\) \[Y/n\]'
+    expect_out_fixed 'OK. Remember to reboot soon.'
+    expect_recorded dnf
+    expect_recorded update
+    expect_not_recorded codecs
+    expect_not_recorded firmware
+}
+
 scenario akmods_already_built "live" "Modules already built for the newest kernel: no akmods/kernel-devel, reboot still advised"
 sc_akmods_already_built() {
     fx_gpu_nvidia "${NV_TU106[@]}"
@@ -2990,6 +3065,19 @@ sc_dnfconf_keep_higher() {
     expect_count "$R/etc/dnf/dnf.conf" '^fastestmirror=1$' 1
     expect_count "$R/etc/dnf/dnf.conf" '^defaultyes=True$' 1
     expect_no_out 'set max_parallel_downloads'
+}
+
+scenario dnfconf_leading_zero "live" "dnf.conf max_parallel_downloads=010 is 10 (done), not octal 8"
+sc_dnfconf_leading_zero() {
+    printf '[main]\nfastestmirror=True\nmax_parallel_downloads=010\ndefaultyes=True\n' > "$R/etc/dnf/dnf.conf"
+    local before
+    before=$(md5sum < "$R/etc/dnf/dnf.conf")
+    invoke --status
+    expect_status_done 'Faster DNF downloads' '[^)]*'
+    invoke --only dnf --force --yes --no-reboot
+    expect_success
+    expect_out 'Kept your max_parallel_downloads=010'
+    check "dnf.conf unchanged" test "$(md5sum < "$R/etc/dnf/dnf.conf")" == "$before"
 }
 
 scenario dnfconf_already_set "live" "dnf.conf already set: --only dnf --force leaves the file byte-identical"
@@ -3110,6 +3198,21 @@ sc_status_flathub_fresh() {
     fx_del installed plasma-discover-flatpak
     invoke --status
     expect_status_todo "Flathub as Discover's app store"
+}
+
+scenario nvidia_not_loaded_no_sb "live" "No Secure Boot, akmod-nvidia built but not loaded: --status and a re-run don't crash"
+sc_nvidia_not_loaded_no_sb() {
+    fx_gpu_nvidia "${NV_TU106[@]}"
+    fx_add installed rpmfusion-free-release rpmfusion-nonfree-release akmod-nvidia
+    fx_add modules "$FX_KERNEL nvidia"
+    invoke --status
+    expect_rc 0
+    expect_status_todo 'Drivers: NVIDIA GeForce RTX 2060 Rev\. A' '◐ partly done: missing a reboot to load it'
+    expect_out_fixed 'Nothing was changed. Run without --status to pick steps.'
+    invoke --all --yes --no-reboot
+    expect_success
+    expect_will_do 'Drivers: NVIDIA'
+    expect_out 'A reboot is recommended'
 }
 
 scenario status_drivers "live" "--status drivers: not installed / module missing / not loaded (+SB) / loaded"
