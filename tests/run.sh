@@ -28,6 +28,10 @@
 # shellcheck source-path=SCRIPTDIR
 set -uo pipefail
 umask 022
+# The checks match UTF-8 text (✔, progress bars); a C locale would see bytes.
+if locale -a 2>/dev/null | grep -Eqix 'c\.utf-?8'; then
+    export LC_ALL=C.UTF-8
+fi
 
 HERE=$(cd "${BASH_SOURCE[0]%/*}" && pwd)
 SCRIPT=${FKS_SCRIPT:-$(cd "$HERE/.." && pwd)/fedora-kde-setup.sh}

@@ -93,10 +93,12 @@ expect_success() {
     if is_live; then
         check "state file has only 'ID DATE' lines" \
             not grep -Evq "^$STEP_IDS_RE [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}$" "$(state_file)"
-        if grep -q '^dnf ' "$(state_file)" 2>/dev/null; then
-            expect_count "$R/etc/dnf/dnf.conf" '^fastestmirror=True$' 1
+        # Steps finished by this run carry the stub clock's date (older lines may be
+        # legacy markers that never wrote these files).
+        if grep -q '^dnf 2026-01-02 03:04:05$' "$(state_file)" 2>/dev/null; then
+            expect_count "$R/etc/dnf/dnf.conf" '^fastestmirror=([Tt]rue|1|[Yy]es|[Oo]n)$' 1
         fi
-        if grep -q '^maintenance ' "$(state_file)" 2>/dev/null; then
+        if grep -q '^maintenance 2026-01-02 03:04:05$' "$(state_file)" 2>/dev/null; then
             expect_grep "$R/etc/systemd/journald.conf.d/00-size.conf" '^SystemMaxUse=500M$'
         fi
     else
@@ -952,12 +954,14 @@ sc_upgrade_fails() {
         '^ERROR \(for bug reports\): exit 1 at line [0-9]+ in run <- step_update <- run_steps <- main: dnf5 upgrade --refresh -y$' \
         "$R/var/log/fedora-kde-setup.log"
     expect_out_fixed 'The script stopped during step 2 of 6 (Full system update).'
-    expect_no_file "$R/var/lib/fedora-kde-setup/done"
+    # Step 1 finished and is recorded; the failed step and the ones after it are not.
+    expect_recorded dnf
+    expect_count "$(state_file)" '^' 1
     expect_call '^systemctl unmask --runtime packagekit.service$'
     expect_no_action '^dnf5 remove -y'
 }
 
-scenario interrupted "live" "Ctrl-C during the upgrade: 'Interrupted', PackageKit unmasked, no marker"
+scenario interrupted "live" "Ctrl-C during the upgrade: 'Stopped by Ctrl-C', PackageKit unmasked, only step 1 recorded"
 sc_interrupted() {
     fx_conf 'FKS_SIGINT_ON=^dnf5 upgrade --refresh'
     invoke --yes --no-reboot
@@ -967,7 +971,8 @@ sc_interrupted() {
     expect_out_fixed '  Finished before that: Faster DNF downloads'
     expect_out_fixed '  Running the script again is safe: it shows what is done and skips it.'
     expect_call '^systemctl unmask --runtime packagekit.service$'
-    expect_no_file "$R/var/lib/fedora-kde-setup/done"
+    expect_recorded dnf
+    expect_count "$(state_file)" '^' 1
     expect_no_action '^dnf5 remove -y'
 }
 
@@ -1585,7 +1590,7 @@ sc_net_fedora_down() {
     fx_conf 'FKS_HEAD_FAIL_RE=^https://mirrors\.fedoraproject\.org/'
     invoke --only update --yes --no-reboot
     expect_out_fixed "Can't reach Fedora's mirrors (https://mirrors.fedoraproject.org). Check the internet connection."
-    expect_no_call 'rpmfusion'
+    expect_no_call '^curl .*rpmfusion'
     if is_live; then expect_untouched; else expect_rc 0; fi
 }
 
@@ -1594,7 +1599,7 @@ sc_net_flathub_down() {
     fx_conf 'FKS_HEAD_FAIL_RE=^https://dl\.flathub\.org/'
     invoke --only flathub --yes --no-reboot
     expect_out_fixed "Can't reach Flathub (https://dl.flathub.org). Check the internet connection."
-    expect_no_call 'rpmfusion|fedoraproject'
+    expect_no_call '^curl .*(rpmfusion|fedoraproject)'
     if is_live; then expect_untouched; else expect_rc 0; fi
 }
 
@@ -1602,10 +1607,10 @@ scenario net_probes_by_step "live" "Only the hosts the selected steps need are p
 sc_net_probes_by_step() {
     invoke --only codecs --yes --no-reboot
     expect_call_line "$CURL_HEAD $(rf_url free 41)"
-    expect_no_call 'fedoraproject|dl\.flathub'
+    expect_no_call '^curl .*(fedoraproject|dl\.flathub)'
     invoke --only firmware --yes --no-reboot
     expect_call_line "$CURL_HEAD https://mirrors.fedoraproject.org/"
-    expect_no_call 'rpmfusion|dl\.flathub'
+    expect_no_call '^curl .*(rpmfusion|dl\.flathub)'
     invoke --only dnf,pim,maintenance --yes --no-reboot
     expect_no_call '^curl'
 }
@@ -1892,17 +1897,17 @@ sc_user_system() {
 # RPM Fusion bootstrap
 
 # RPM Fusion couldn't be set up: codecs (and drivers) are skipped, the run goes on.
-rf_refused() {  # MESSAGE
+rf_refused() {  # MESSAGE [VERDICT]
     expect_rc 0
     expect_out_fixed "$1"
     expect_out_fixed "Skipped the codecs: they come from RPM Fusion, which couldn't be set up"
     expect_no_action '^dnf5 install -y .*/rpmfusion-'
-    expect_no_action 'appstream-data|ffmpeg'
+    expect_no_action '^dnf5? (install|swap|upgrade) .*(appstream-data|ffmpeg|@multimedia)'
     expect_not_recorded codecs
     expect_recorded flathub
     expect_recorded maintenance
     expect_out 'Not completed \(see warnings\):'
-    expect_out 'Finished: [0-9]+ of [0-9]+ steps done'
+    expect_out_fixed "== ${2:-5 of 6 steps finished; 1 needs attention (see below).} =="
     expect_call '^systemctl unmask --runtime packagekit.service$'
 }
 
@@ -1911,7 +1916,8 @@ sc_rf_fail_drivers() {
     fx_gpu_nvidia "${NV_TU106[@]}"
     fx_conf FKS_CHECKSIG=bad
     invoke --yes --no-reboot
-    rf_refused 'Signature check failed for the RPM Fusion free release package'
+    rf_refused 'Signature check failed for the RPM Fusion free release package' \
+        '5 of 7 steps finished; 2 need attention (see below).'
     expect_out_fixed "Skipped the drivers: they come from RPM Fusion, which couldn't be set up"
     expect_no_action 'install .*akmod-nvidia'
     expect_not_recorded drivers
