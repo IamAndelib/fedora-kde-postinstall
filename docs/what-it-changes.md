@@ -3,32 +3,64 @@
 This page lists everything `fedora-kde-setup.sh` does, every file it touches, and exactly what it deletes. To see the precise commands for *your* computer, run `sudo bash fedora-kde-setup.sh --dry-run`.
 
 **On this page:**
-- [Step by step](#step-by-step)
+- [How a run works](#how-a-run-works)
+- [The steps](#the-steps)
+- [Already set up? What each step does then](#already-set-up-what-each-step-does-then)
 - [Files and settings it changes](#files-and-settings-it-changes)
 - [What it deletes](#what-it-deletes)
 - [What it does not do](#what-it-does-not-do)
 - [Safety checks](#safety-checks)
 - [Requirements in detail](#requirements-in-detail)
 
-## Step by step
+## How a run works
 
-1. **Checks.** Fedora version, KDE edition, 64-bit Intel/AMD CPU, free disk space, AC power, a healthy package database, no other package manager running, internet access, and which user's data to clean up. A lock stops two copies running at once.
-2. **Hardware detection.** CPU, every graphics card (by PCI ID), the Wi-Fi chip, Secure Boot, laptop or desktop, virtual machine or container. You see a summary and **the plan for your computer, then confirm once**.
-3. **Faster DNF.** Sets `fastestmirror=True`, `max_parallel_downloads=10` and `defaultyes=True`. Discover's updater (PackageKit) is paused while the script runs, and any update waiting to install at the next reboot is cancelled, because the script installs those updates now.
-4. **Full system update** with `dnf upgrade --refresh`.
-5. **RPM Fusion and OpenH264.** RPM Fusion is the community repository for software Fedora can't ship.
-   - Its free and nonfree release packages are installed **only after their signatures verify** against RPM Fusion's keys as shipped by Fedora (`distribution-gpg-keys`).
-   - It also enables Fedora's Cisco OpenH264 repository.
-6. **Codecs.** Swaps `ffmpeg-free` for the full `ffmpeg`, and installs the GStreamer bad/ugly/libav/OpenH264 plugins, LAME (MP3), and video thumbnails in Dolphin.
-7. **Hardware video decoding.** Intel: `intel-media-driver`. AMD: `mesa-va-drivers-freeworld` (H.264/HEVC). NVIDIA: `libva-nvidia-driver`.
-8. **Drivers** for the hardware it found: NVIDIA, Broadcom Wi-Fi, or virtual machine guest tools. See [Hardware and drivers](hardware.md).
-9. **Removes KDE PIM and LibreOffice**, plus dependencies nothing else uses, then deletes their data from your home folder. See [What it deletes](#what-it-deletes).
-10. **Flathub.**
-    - Enables the full Flathub catalogue (Fedora shows a filtered one) and installs Discover's Flatpak support.
-    - Removes Fedora's own Flatpak sources if nothing is installed from them, so Discover stops listing apps twice.
-11. **Firmware.** Installs available firmware updates with `fwupdmgr`. Skipped in virtual machines.
-12. **Maintenance.** Enables the weekly SSD trim (`fstrim.timer`) and caps the system log (journal) at 500 MB.
-13. **Summary.** What was done, any warnings, where the log is, how to undo package changes, and Secure Boot steps if needed. Then it offers to reboot.
+1. **Checks.** Fedora version, KDE edition, 64-bit Intel/AMD CPU, and which user's data it may clean up.
+2. **Hardware detection.** CPU, every graphics card (by PCI ID), the Wi-Fi chip, Secure Boot, laptop or desktop, virtual machine or container.
+3. **What's already done.** Each step is checked against your real system (see [below](#already-set-up-what-each-step-does-then)), including things you set up yourself.
+4. **Checklist.** You tick the steps you want. Nothing is ticked by default; `r` ticks all recommended ones. Steps that don't apply to your computer are greyed out with the reason.
+5. **More checks, only for what you picked.**
+   - **For steps that change packages:** free disk space, AC power, a healthy package database and no other package manager running.
+   - **For steps that download:** internet access.
+   - **Always:** a lock stops two copies running at once.
+6. **Confirm once,** then the steps run with a progress bar. Discover's updater (PackageKit) is paused while packages change. An update waiting to install at the next reboot is cancelled, because the script installs updates itself.
+7. **Summary.** What was done, skipped or not completed, any warnings, where the log is, how to undo package changes, and Secure Boot steps if needed. If a reboot is recommended, it offers one.
+
+## The steps
+
+| Step (ID) | Tag | What it does |
+|---|---|---|
+| Faster DNF downloads (`dnf`) | Recommended | Sets `fastestmirror=True`, `max_parallel_downloads=10` and `defaultyes=True` in `/etc/dnf/dnf.conf`. Keeps settings that are already there, and never lowers a higher `max_parallel_downloads`. |
+| Full system update (`update`) | Recommended | `dnf upgrade --refresh`. |
+| Media codecs and video acceleration (`codecs`) | Recommended | Adds RPM Fusion. Its free and nonfree release packages are installed **only after their signatures verify** against RPM Fusion's keys as shipped by Fedora (`distribution-gpg-keys`). Also: enables Fedora's Cisco OpenH264 repository; swaps `ffmpeg-free` for the full `ffmpeg`; installs the GStreamer bad/ugly/libav/OpenH264 plugins, LAME (MP3) and video thumbnails in Dolphin; installs hardware video decoding (Intel: `intel-media-driver`; AMD: `mesa-va-drivers-freeworld`). |
+| Drivers (`drivers`) | Recommended | Only when your hardware needs them: NVIDIA, Broadcom Wi-Fi, or virtual machine guest tools. See [Hardware and drivers](hardware.md). NVIDIA and Broadcom drivers come from RPM Fusion and need an up-to-date system, so the system update is ticked automatically along with them. |
+| Remove KDE PIM (`pim`) | Optional | Removes KMail, Kontact, KOrganizer, Akonadi and friends, plus dependencies nothing else uses, then deletes their data. See [What it deletes](#what-it-deletes). |
+| Remove LibreOffice (`libreoffice`) | Optional | Removes LibreOffice and dependencies nothing else uses, then deletes its settings. |
+| Flathub as Discover's app store (`flathub`) | Recommended | See the list below the table. |
+| Firmware updates (`firmware`) | Recommended | Installs available firmware updates with `fwupdmgr`. Not offered in virtual machines. |
+| SSD trim + smaller system logs (`maintenance`) | Optional | Enables the weekly SSD trim (`fstrim.timer`) and caps the system log (journal) at 500 MB. |
+
+What the Flathub step does:
+- installs Flatpak and Discover's Flatpak support if missing;
+- enables the full Flathub catalogue (Fedora ships a filtered one) and gives it the highest priority;
+- makes Flatpak/Flathub **Discover's default source**, the same as Discover's own "Make default" button;
+- **disables** Fedora's own Flatpak sources (`fedora`, `fedora-testing`), so apps aren't listed twice. If you already have apps installed from them, they stay enabled at a lower priority so those apps keep getting updates.
+
+## Already set up? What each step does then
+
+The script looks at your system, not just at its own earlier runs, and shows each step as ✔ done, ◐ partly done, or not done. Running a step that is already done is safe; it only fills in what's missing.
+
+| Step | Counts as done when | Running it again |
+|---|---|---|
+| `dnf` | `fastestmirror` and `defaultyes` are on and `max_parallel_downloads` is 10 or more | Leaves matching settings untouched and keeps your higher values |
+| `update` | `dnf check-upgrade` finds no updates | Installs whatever is new |
+| `codecs` | RPM Fusion, full ffmpeg, the GStreamer plugins and your GPU's video driver are installed | Installs only what's missing |
+| `drivers` | The driver packages are installed and the module is built for your running kernel | Doesn't rebuild modules that already exist |
+| `pim` / `libreoffice` | The apps aren't installed | If the apps are gone but their data is still in your home folder, the step becomes "Remove leftover … data". It's never ticked by `r`, `a` or `--all`, so leftover data is only deleted when you tick it yourself. |
+| `flathub` | Flathub is enabled without a filter, Fedora's duplicate source is off, and Flatpak is Discover's default | Fixes only what's missing |
+| `firmware` | Can't be known without asking the vendor server; shows when it was last checked | Checks again |
+| `maintenance` | `fstrim.timer` is enabled and the journal size cap is in place | Writes the same settings again |
+
+The script also remembers which steps it finished, in `/var/lib/fedora-kde-setup/done`.
 
 ## Files and settings it changes
 
@@ -39,9 +71,10 @@ This page lists everything `fedora-kde-setup.sh` does, every file it touches, an
 | Packages | System update, codecs and drivers added, KDE PIM and LibreOffice removed. Everything is recorded in `dnf history`. |
 | Journal size | `/etc/systemd/journald.conf.d/00-size.conf` (`SystemMaxUse=500M`) |
 | Services | `fstrim.timer` enabled; `nvidia-fallback.service` enabled with the NVIDIA driver. PackageKit is paused only while the script runs (a temporary "runtime" mask). |
-| Flatpak | `flathub` enabled without Fedora's filter; the `fedora` / `fedora-testing` sources removed if unused |
+| Flatpak | `flathub` enabled without Fedora's filter, with priority 10; the `fedora` / `fedora-testing` sources disabled if unused (or set to priority 1 if apps are installed from them) |
+| Discover | `~/.config/discoverrc`: `currentApplicationBackend=flatpak-backend` (Flathub is the default source) |
 | Secure Boot | Only with NVIDIA or Broadcom `wl` and Secure Boot on: a driver signing key in `/etc/pki/akmods/`, queued for enrollment |
-| Script's own files | `/var/lib/fedora-kde-setup/done` (marks a finished run), `/var/log/fedora-kde-setup.log` (log, readable only by root), `/run/fedora-kde-setup.lock` |
+| Script's own files | `/var/lib/fedora-kde-setup/done` (which steps finished, and when), `/var/log/fedora-kde-setup.log` (log, readable only by root), `/run/fedora-kde-setup.lock` |
 | Generated MOK password | `/root/fedora-kde-setup-mok-password.txt` (readable only by root). Only created when Secure Boot setup ran unattended (`--yes` or no terminal). |
 
 ## What it deletes
@@ -81,8 +114,8 @@ On a fresh install these hold nothing important. **If you've already used KMail,
 ## Safety checks
 
 - **Dry run:** `--dry-run` prints every command without running any.
-- **One confirmation:** nothing changes until you approve the plan. With `--yes` there's no question; without a terminal and without `--yes`, it refuses to start.
-- **Stops before starting if something's off:** low disk space, running on battery, wrong CPU architecture, a broken package database, or another package manager already running.
+- **You choose:** nothing is ticked by default, and nothing changes until you confirm your choice. `--yes` needs an explicit `--only` or `--all`.
+- **Stops before starting if something's off:** wrong CPU architecture; and, when you picked steps that change packages, low disk space, running on battery, a broken package database, or another package manager already running.
 - **Verified downloads:**
   - Everything is downloaded over HTTPS only, including redirects.
   - The RPM Fusion release packages must pass a signature check (`rpmkeys --checksig`) against keys shipped by Fedora, and must have the right package name, or the script stops.
@@ -95,7 +128,7 @@ On a fresh install these hold nothing important. **If you've already used KMail,
   - **Secure Boot:** if the Secure Boot key can't be set up, it skips the driver rather than install one that wouldn't load.
   - **Fallback:** `nvidia-fallback.service` falls back to the open-source driver instead of a black screen.
 - **PackageKit (Discover):** if it's busy installing something, the script waits up to 2 minutes, then stops without changing anything. It never interrupts a running installation.
-- **No double runs:** a lock stops two copies running at once, and a completion marker stops accidental re-runs (`--force` overrides it).
+- **Safe to run again:** a lock stops two copies running at once. Steps that are already done are shown as done and not ticked; your own settings are kept.
 - **Hardened:** fixed `PATH`, `umask` and locale; inherited shell settings aren't trusted; the log and the password file are readable only by root. See [SECURITY.md](../SECURITY.md).
 - **Full log:** every command it ran is in `/var/log/fedora-kde-setup.log`.
 

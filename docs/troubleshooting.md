@@ -35,10 +35,13 @@ When a check fails, the script stops **before changing anything**. Fix the cause
 | `The RPM database doesn't respond…` | Run `sudo rpm --rebuilddb`, then try again. |
 | `Run this with sudo…` | Start it with `sudo bash fedora-kde-setup.sh`. |
 | `Can't tell which user to clean up…` / `Refusing to clean root's home…` | Run it from your normal account with `sudo`, not as root. Or name the user: `--user yourname`. |
-| `No terminal to confirm on; re-run with --yes` | You started it without a terminal (for example from a script). Add `--yes` if that's intended. |
-| `Setup already completed on …` | It already ran on this computer. To run it again on purpose, add `--force`. |
+| `Choose steps with --only ... or --all` | With `--yes` there's no checklist, so say which steps to run: `--all`, or for example `--only update,codecs`. See `--list-steps`. |
+| `No terminal to show the checklist on…` / `No terminal to confirm on…` | You started it without a terminal (for example from a script). Use `--only …` or `--all`, plus `--yes`. |
+| `Nothing to do: the selected steps are already done` | Everything you picked is already in place. Use `--force` to redo it anyway. |
+| `Step N isn't available: …` | That step doesn't apply to your computer; the reason is shown next to it. |
 | `Another run of this script is already in progress` | It's already running in another window. Wait for that one to finish. |
 | `Skipped removing KDE PIM…` / `Kept KDE PIM data…` | Removing the apps would have removed something else too, so they and their data were left alone. The message says what, and how to remove them by hand if you still want to. |
+| `Kept Fedora's 'fedora' Flatpak source enabled…` | You have apps installed from Fedora's Flatpak source, so it stays on to keep them updated. Flathub is still preferred. |
 
 ## NVIDIA: black screen or nvidia-smi fails
 
@@ -60,9 +63,9 @@ Every package change is recorded by DNF. The summary at the end of the run tells
 | RPM Fusion | Remove the packages you installed from it, then `sudo dnf remove rpmfusion-free-release rpmfusion-nonfree-release` |
 | DNF settings | Edit `/etc/dnf/dnf.conf` |
 | Journal size cap | `sudo rm /etc/systemd/journald.conf.d/00-size.conf && sudo systemctl restart systemd-journald` |
-| Fedora's Flatpak source | `flatpak remote-add --if-not-exists fedora oci+https://registry.fedoraproject.org` |
+| Fedora's Flatpak source | `sudo flatpak remote-modify --enable fedora` |
+| Flathub as Discover's default | Discover → Settings → pick another source and click "Make default" |
 | A Secure Boot key | `sudo mokutil --revoke-import` (before enrolling) or `sudo mokutil --delete /etc/pki/akmods/certs/public_key.der` (after) |
-| Allow the script to run again | Add `--force`, or `sudo rm /var/lib/fedora-kde-setup/done` |
 
 ## FAQ
 
@@ -70,13 +73,13 @@ Every package change is recorded by DNF. The summary at the end of the run tells
 Only if you don't use KDE PIM or LibreOffice, or you've backed up their data. See [what it deletes](what-it-changes.md#what-it-deletes). Everything else is safe on an existing system.
 
 **Can I keep LibreOffice or KMail?**
-Not with the script as it is; removing them is one of its jobs. You can reinstall them afterwards from Discover or Flathub.
+Yes. Removing them are optional steps; just don't tick them.
 
 **What is RPM Fusion, and is it safe?**
 It's the long-standing community repository for software Fedora can't include, such as full ffmpeg, patented codecs and the NVIDIA driver. Fedora's own documentation points to it. The script checks its signatures before installing it.
 
 **Is it safe to run twice?**
-Yes. Every step can safely repeat. The completion marker only stops accidental re-runs; use `--force` to run it on purpose.
+Yes, as often as you like. It shows what's already done, keeps your own settings, and only does what you tick. `--status` shows the overview without changing anything.
 
 **Does it work on Fedora Workstation (GNOME)?**
 No. It refuses to run unless the system is Fedora KDE Plasma.

@@ -3,15 +3,23 @@
 [![CI](https://github.com/IamAndelib/fedora-kde-postinstall/actions/workflows/ci.yml/badge.svg)](https://github.com/IamAndelib/fedora-kde-postinstall/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**One script that gets a freshly installed Fedora KDE Plasma ready for everyday use.** You run it once, right after installing Fedora. It shows you what it's going to do and asks before changing anything.
+**One script that gets a freshly installed Fedora KDE Plasma ready for everyday use.** It shows what's already set up on your computer, lets you **tick the tweaks you want** from a simple checklist, and asks before changing anything.
 
-## What it does
+## What you can choose
 
-- **Updates your system**, and makes future downloads faster.
-- **Adds the media codecs** Fedora can't ship, so videos and music just play.
-- **Installs the right drivers for your hardware**: NVIDIA graphics, Broadcom Wi-Fi, or virtual machine tools.
-- **Removes KDE's email/calendar apps (KDE PIM) and LibreOffice**, along with their data.
-- **Enables the full Flathub app store** in Discover, updates your firmware, and turns on a few maintenance settings.
+| | Tweak | What it does |
+|---|---|---|
+| ⭐ | Faster DNF downloads | Picks the fastest mirror and downloads 10 files at once. |
+| ⭐ | Full system update | Installs all pending security fixes, bug fixes and newer apps. |
+| ⭐ | Media codecs | Lets common video and music formats play, using your graphics card. |
+| ⭐ | Drivers for your hardware | NVIDIA graphics, Broadcom Wi-Fi, or virtual machine tools (only when needed). |
+| ⭐ | Flathub as Discover's app store | Full Flathub catalogue as Discover's default, without Fedora's duplicate apps. |
+| ⭐ | Firmware updates | BIOS/UEFI and device updates from your computer's vendor. |
+| ○ | Remove KDE PIM | Removes KMail, Kontact, KOrganizer… **and deletes their data**. |
+| ○ | Remove LibreOffice | Removes the office suite **and deletes its settings**. |
+| ○ | SSD trim + smaller logs | Weekly SSD trim; system logs capped at 500 MB. |
+
+⭐ = **Recommended** for almost everyone · ○ = **Optional**, up to you. Every step is explained in the checklist itself. Want every detail? See [exactly what it changes](docs/what-it-changes.md).
 
 Want every detail? See [exactly what it changes](docs/what-it-changes.md).
 
@@ -23,8 +31,9 @@ Want every detail? See [exactly what it changes](docs/what-it-changes.md).
 - with an **internet connection**, and your laptop is **plugged in**.
 
 ❌ **No, if:**
-- you use **KMail, KOrganizer, KAddressBook or LibreOffice**. They are removed, and **their data is deleted**.
 - you're on Fedora Workstation (GNOME), Fedora Atomic/Kinoite, or an ARM computer.
+
+Use KMail or LibreOffice? That's fine: just don't tick those two removal steps.
 
 You don't need to check the technical details yourself. The script checks everything (Fedora version, disk space, power, etc.) and stops if something isn't right.
 
@@ -64,7 +73,7 @@ sudo bash fedora-kde-setup.sh --dry-run
 > [!NOTE]
 > `sudo` asks for **your own password**. Nothing appears on screen while you type it; that's normal. Just type it and press **Enter**.
 
-You'll see your hardware (CPU, graphics, Wi-Fi…) and a numbered list of the steps it would take.
+You'll see your hardware (CPU, graphics, Wi-Fi…), what's already done, and the commands each step would run.
 
 ### 5. Run it
 
@@ -72,15 +81,43 @@ You'll see your hardware (CPU, graphics, Wi-Fi…) and a numbered list of the st
 sudo bash fedora-kde-setup.sh
 ```
 
-1. It shows the same plan and asks `Proceed? [y/N]`. Type **`y`** and press **Enter**.
-2. It then works on its own for **about 15–60 minutes**, depending on your internet speed and hardware.
+It shows a colored checklist. Nothing is ticked at first:
+
+```
+  Already done: 1   Partly done: 1   Not done yet: 6
+
+  1. [ ] Faster DNF downloads [Recommended]
+        Picks the fastest mirror and downloads 10 files at once, so updates finish sooner.
+  2. [ ] Full system update [Recommended]  • 37 updates available
+        Installs all pending updates: security fixes, bug fixes and newer apps.
+  ...
+  6. [ ] Remove LibreOffice [Optional]
+        Removes the office suite if you use something else. Deletes its settings.
+  ...
+  Type numbers to tick/untick (e.g. "1 3 5"), r = all recommended, a = everything not done yet,
+  n = none, Enter = continue, q = quit
+>
+```
+
+1. **Tick what you want.** Type **`r`** and press **Enter** to tick all ⭐ recommended steps. Add or remove single steps by typing their numbers, for example `5 6` to also remove KDE PIM and LibreOffice.
+2. **Press Enter** on an empty line to continue. It lists what it will do and asks `Proceed? [y/N]`; type **`y`**.
+3. It then works on its own, with a **progress bar** showing how far along it is. A full run takes **about 15–60 minutes**, depending on your internet speed and hardware.
 
 > [!WARNING]
 > Keep the Konsole window open, and keep a laptop **plugged in** until it's finished.
 
 ### 6. Reboot
 
-At the end it shows a summary and asks `Reboot now? [Y/n]`. Press **Enter** to restart.
+At the end it shows a summary. If a reboot is recommended (new kernel, drivers or firmware), it asks `Reboot now? (recommended) [Y/n]`. Press **Enter** to restart.
+
+## Running it again
+
+Run it again any time, as often as you like:
+- **It checks your system** and marks what's already done (✔), partly done (◐) or not done yet. This includes things you set up yourself.
+- **Done steps** are simply not ticked. You can still tick them to redo them; that's safe.
+- **Nothing is undone or overwritten.** Your own settings are kept. For example, if you've set more than 10 parallel downloads, the script keeps your value.
+
+To only see what's done without changing anything: `sudo bash fedora-kde-setup.sh --status`
 
 ## After the reboot
 
@@ -96,15 +133,24 @@ Missed the screen or forgot the password? See [Secure Boot help](docs/hardware.m
 
 ## Options
 
+Most people never need these; the checklist does everything.
+
 | Option | What it does |
 |---|---|
-| `--dry-run` | Show the plan and every command, but change nothing |
-| `--yes` | Don't ask for confirmation (for unattended runs) |
+| `--status` | Show what's already done; change nothing |
+| `--dry-run` | Show what would happen and every command, but change nothing |
+| `--list-steps` | List the step names used by `--only` and `--skip` |
+| `--only dnf,codecs` | Run only these steps, without the checklist |
+| `--all` | Run every step that applies and isn't done yet |
+| `--skip pim,libreoffice` | With `--all`: leave these steps out |
+| `--yes` | Don't ask questions (needs `--only` or `--all`) |
+| `--force` | With `--only`/`--all`: also redo steps that are already done |
 | `--no-reboot` | Don't offer to reboot at the end |
-| `--force` | Run again on a computer where it already finished |
 | `--user NAME` | Clean up this user's data instead of yours |
 
-Example: `sudo bash fedora-kde-setup.sh --yes --no-reboot`
+Example (everything except the removals, no questions): `sudo bash fedora-kde-setup.sh --all --skip pim,libreoffice --yes`
+
+Step names: `dnf`, `update`, `codecs`, `drivers`, `pim`, `libreoffice`, `flathub`, `firmware`, `maintenance`.
 
 ## Something went wrong?
 

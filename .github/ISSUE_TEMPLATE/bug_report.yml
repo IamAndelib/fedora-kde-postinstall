@@ -11,7 +11,7 @@ body:
     attributes:
       label: Script version
       description: Output of `bash fedora-kde-setup.sh --version`
-      placeholder: fedora-kde-setup 1.0.0
+      placeholder: fedora-kde-setup 1.2.0
     validations:
       required: true
   - type: input
@@ -25,7 +25,7 @@ body:
     id: hardware
     attributes:
       label: Hardware summary and plan
-      description: Paste the "Detecting hardware" and "Planned actions" sections from `sudo bash fedora-kde-setup.sh --dry-run --force`.
+      description: Paste the output of `sudo bash fedora-kde-setup.sh --status` (hardware and what is already done).
       render: text
     validations:
       required: true
