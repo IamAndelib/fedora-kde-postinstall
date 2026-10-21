@@ -209,7 +209,7 @@ expect_nvidia() {  # "PKGS" expected in the driver install line
 }
 
 expect_no_kmods() {
-    expect_no_action 'akmod-nvidia'
+    expect_no_action '^dnf5? install .*akmod-nvidia'
     expect_no_install broadcom-wl
     expect_no_action 'kernel-devel'
     expect_no_action '^akmods'
@@ -671,7 +671,7 @@ sc_broadcom_wl() {
     expect_install broadcom-wl
     expect_install "kernel-devel-$FX_KERNEL"
     expect_action "^akmods --force --kernels $FX_KERNEL$"
-    expect_no_action 'akmod-nvidia'
+    expect_no_action '^dnf5? install .*akmod-nvidia'
     if is_live; then expect_out "Kernel module 'wl' built"; fi
 }
 
@@ -2158,9 +2158,11 @@ expect_menu_shown() {
     check "alternate screen left and cursor shown again" last_screen_restored
 }
 
-last_screen_restored() {  # the last alternate-screen / cursor sequences restore the terminal
+last_screen_restored() {  # the last alternate-screen / cursor / mouse sequences restore the terminal
     [[ $(grep -ao $'\e\\[?1049[hl]' "$T/raw.txt" | tail -n1) == $'\e[?1049l' ]] &&
-        [[ $(grep -ao $'\e\\[?25[lh]' "$T/raw.txt" | tail -n1) == $'\e[?25h' ]]
+        [[ $(grep -ao $'\e\\[?25[lh]' "$T/raw.txt" | tail -n1) == $'\e[?25h' ]] &&
+        [[ $(grep -ao $'\e\\[?1000[hl]' "$T/raw.txt" | tail -n1) != $'\e[?1000h' ]] &&
+        [[ $(grep -ao $'\e\\[?1006[hl]' "$T/raw.txt" | tail -n1) != $'\e[?1006h' ]]
 }
 
 expect_nothing_changed() {  # left without running anything
@@ -2367,6 +2369,148 @@ sc_menu_ss3_arrows() {
     invoke --no-reboot
     expect_will_do '1. Full system update'
     expect_nothing_changed
+}
+
+# Mouse (SGR reports, ESC [ < button ; column ; row M, release ends in m) and extra keys.
+readonly WHEEL_UP='\e[<64;10;5M' WHEEL_DOWN='\e[<65;10;5M'
+readonly CTRL_UP='\e[1;5A' SHIFT_DOWN='\e[1;2B' KEY_END='\e[F' PG_DOWN='\e[6~' PG_UP='\e[5~' F5='\e[15~'
+click() { printf '\\e[<0;10;%dM\\e[<0;10;%dm' "$1" "$1"; }  # left press + release on screen row $1
+
+first_frame() {  # the first menu screen as plain text (line N = screen row N)
+    local raw
+    raw=$(<"$T/raw.txt")
+    raw=${raw#*$'\e[?1049h'}
+    raw=${raw#*$'\e[H\e[2J'}
+    raw=${raw%%$'\e[H\e[2J'*}
+    sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\r$//' <<<"$raw"
+}
+frame_row() {  # TEXT -> screen row of its first line in the first menu screen (0 if absent)
+    local n
+    n=$(first_frame | grep -nF -m1 -- "$1" | cut -d: -f1)
+    echo "${n:-0}"
+}
+expect_review_only() {  # TITLE: the review lists exactly this one step
+    expect_out '^  Ready to start 1 step'
+    expect_will_do "$1"
+}
+
+scenario menu_wheel_one_step "pty" "Menu: one wheel notch moves exactly one step (not three)"
+sc_menu_wheel_one_step() {
+    AUTO_ALL=0
+    menu_machine
+    # Clear, one notch down = row 1 (update), select it, jump to Continue.
+    PTY_INPUT=$(keys n "$WHEEL_DOWN" "$ENTER" "$KEY_END" "$ENTER")$START_NO
+    invoke --no-reboot
+    expect_rc 0
+    expect_review_only 'Full system update'
+    expect_nothing_changed
+    check "mouse reporting turned on in the menu" grep -q $'\e\\[?1000h\e\\[?1006h' "$T/raw.txt"
+    check "mouse reporting turned off again" last_screen_restored
+}
+
+scenario menu_wheel_clamp "pty" "Menu: the wheel stops at the first step and at Quit instead of wrapping (arrows still wrap)"
+sc_menu_wheel_clamp() {
+    AUTO_ALL=0
+    menu_machine
+    # Up at the top stays on row 0 (DNF); wrapping would land on Quit and quit.
+    PTY_INPUT=$(keys n "$WHEEL_UP" "$WHEEL_UP" "$ENTER" "$KEY_END" "$ENTER")$START_NO
+    invoke --no-reboot
+    expect_rc 0
+    expect_review_only 'Faster DNF downloads'
+    # Continue -> Quit, down again stays on Quit, up -> Continue: the review comes.
+    PTY_INPUT=$(keys "$KEY_END" "$WHEEL_DOWN" "$WHEEL_DOWN" "$WHEEL_UP" "$ENTER")$START_NO
+    invoke --no-reboot
+    expect_rc 0
+    expect_out '^  Ready to start 5 steps'
+    expect_nothing_changed
+    # Arrow keys still wrap: up from the top is Quit.
+    PTY_INPUT=$(keys "$UP" "$ENTER")
+    invoke --no-reboot
+    expect_rc 0
+    expect_no_out 'Ready to start'
+    expect_out_fixed 'Nothing was changed.'
+}
+
+scenario menu_click_toggle "pty" "Menu: a click on a step row (or its explanation) selects it; the release is ignored"
+sc_menu_click_toggle() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='q'
+    invoke --no-reboot
+    local fw why
+    fw=$(frame_row 'Firmware updates')
+    why=$(frame_row 'Picks the fastest mirror')
+    check "Firmware row found on the first screen (row $fw)" test "$fw" -gt 0
+    check "DNF explanation line found on the first screen (row $why)" test "$why" -gt 0
+    PTY_INPUT=$(keys n "$(click "$fw")" "$KEY_END" "$ENTER")$START_NO
+    invoke --no-reboot
+    expect_rc 0
+    expect_review_only 'Firmware updates'
+    expect_nothing_changed
+    # The highlighted step's explanation line belongs to that step.
+    PTY_INPUT=$(keys n "$(click "$why")" "$KEY_END" "$ENTER")$START_NO
+    invoke --no-reboot
+    expect_review_only 'Faster DNF downloads'
+    # Clicking the same row twice selects and unselects.
+    PTY_INPUT=$(keys n "$(click "$fw")" "$(click "$fw")" "$KEY_END" "$ENTER" q)
+    invoke --no-reboot
+    expect_rc 0
+    expect_out_fixed 'Select at least one step first'
+    expect_no_out 'Ready to start'
+    # A scrolled menu (18 rows): rows still map to the right steps.
+    PTY_ROWS=18 PTY_COLS=60
+    PTY_INPUT='q'
+    invoke --no-reboot
+    local upd
+    upd=$(frame_row 'Full system update')
+    check "first screen at 18 rows is scrolled" grep -q 'more line(s)' <(first_frame)
+    check "update row found at 18 rows (row $upd)" test "$upd" -gt 0
+    PTY_INPUT=$(keys n "$(click "$upd")" "$KEY_END" "$ENTER")$START_NO
+    invoke --no-reboot
+    expect_review_only 'Full system update'
+}
+
+scenario menu_click_continue "pty" "Menu: a click on Continue opens the review; a click on Quit quits; blank rows do nothing"
+sc_menu_click_continue() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='q'
+    invoke --no-reboot
+    local cont quit
+    cont=$(frame_row 'Continue with 5 selected steps')
+    quit=$(frame_row 'Quit without changes')
+    check "Continue and Quit rows found (rows $cont, $quit)" test "$cont" -gt 0 -a "$quit" -eq $(( cont + 1 ))
+    # Row 1 is the title and the row under Quit is blank: neither does anything.
+    PTY_INPUT=$(keys "$(click 1)" "$(click $(( quit + 1 )))" "$(click "$cont")")$START_NO
+    invoke --no-reboot
+    expect_rc 0
+    expect_out '^  Ready to start 5 steps'
+    expect_nothing_changed
+    PTY_INPUT=$(click "$quit")
+    invoke --no-reboot
+    expect_rc 0
+    expect_no_out 'Ready to start'
+    expect_out_fixed 'Nothing was changed.'
+}
+
+scenario menu_modified_arrows "pty" "Menu: Ctrl/Shift+arrows move (no stray 'A' selecting all); PgUp/PgDn; unknown keys ignored"
+sc_menu_modified_arrows() {
+    AUTO_ALL=0
+    menu_machine
+    # Shift+Down -> update, select; Ctrl+Up -> DNF, select; F5 ignored; PgDn -> Continue.
+    PTY_INPUT=$(keys n "$SHIFT_DOWN" "$ENTER" "$CTRL_UP" "$ENTER" "$F5" "$PG_DOWN" "$ENTER")$START_NO
+    invoke --no-reboot
+    expect_rc 0
+    expect_out '^  Ready to start 2 steps'
+    expect_will_do 'Faster DNF downloads'
+    expect_will_do 'Full system update'
+    expect_no_will_do 'Media codecs'
+    expect_no_will_do 'Firmware updates'
+    expect_nothing_changed
+    # PgUp goes back to the first step: Enter there selects DNF only.
+    PTY_INPUT=$(keys n "$PG_DOWN" "$PG_UP" "$ENTER" "$KEY_END" "$ENTER")$START_NO
+    invoke --no-reboot
+    expect_review_only 'Faster DNF downloads'
 }
 
 scenario menu_toggle_off "pty" "Menu: Space twice unselects; nothing selected -> message"
@@ -2669,7 +2813,7 @@ sc_skip_update_drivers() {
     expect_no_will_do 'Full system update'
     expect_no_will_do 'Drivers'
     expect_no_call '^dnf5 upgrade --refresh'
-    expect_no_action 'akmod-nvidia'
+    expect_no_action '^dnf5? install .*akmod-nvidia'
 }
 
 scenario only_drivers_dep "dry" "--only drivers with pending updates: update added, 'needed by the drivers'"
@@ -2896,8 +3040,6 @@ sc_status_fresh() {
     expect_status_todo 'Media codecs and video acceleration'
     expect_status_todo 'Remove KDE PIM \(KMail, Kontact, KOrganizer\.\.\.\)' '• currently installed'
     expect_status_todo 'Remove LibreOffice' '• currently installed'
-    expect_status_todo "Flathub as Discover's app store" \
-        "◐ partly done: missing Flathub, Fedora's duplicate Flatpak source disabled, Flathub as Discover's default"
     expect_status_todo 'Firmware updates' '• not checked yet'
     expect_status_todo 'SSD trim \+ smaller system logs'
     expect_out_before '^    RECOMMENDED$' '^    OPTIONAL$'
@@ -2954,6 +3096,20 @@ sc_status_partial() {
     expect_status_todo "Flathub as Discover's app store" '◐ partly done: missing the full \(unfiltered\) Flathub'
     expect_status_todo 'Firmware updates' '• last checked 2026-03-04'
     expect_status_todo 'SSD trim \+ smaller system logs' '◐ partly done: partly set up'
+}
+
+scenario status_flathub_fresh "live" "--status flathub: Flatpak present but nothing set up = partly done; no Flatpak = to do"
+sc_status_flathub_fresh() {
+    # Fresh Fedora KDE: Flatpak and Discover's Flatpak support are there, the rest isn't.
+    invoke --status
+    expect_status_todo "Flathub as Discover's app store" \
+        "◐ partly done: missing Flathub, Fedora's duplicate Flatpak source disabled, Flathub as Discover's default"
+    # Without the flatpak command at all it's plain "to do".
+    fx_missing flatpak
+    rm -rf "$STUBDIR" "$S/pool"    # rebuilt by the next invoke, without flatpak
+    fx_del installed plasma-discover-flatpak
+    invoke --status
+    expect_status_todo "Flathub as Discover's app store"
 }
 
 scenario status_drivers "live" "--status drivers: not installed / module missing / not loaded (+SB) / loaded"

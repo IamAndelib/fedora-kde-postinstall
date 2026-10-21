@@ -131,7 +131,16 @@ cleanup_dir() {  # $1 = dir; files made by root runs may need root to delete
     rm -rf -- "$1" 2>/dev/null || "${ROOTCMD[@]}" rm -rf -- "$1"
 }
 
+# As root, user/upty runs go through user "nobody", who must be able to use the whole
+# scenario dir. Done before any snapshot too, so the mode change isn't seen as a change.
+share_with_nobody() {
+    if (( EUID == 0 )) && [[ $MODE == user || $MODE == upty ]]; then
+        chmod -R a+rwX "$T"
+    fi
+}
+
 tree_state() {  # DIR... -> listing + checksums, for "nothing changed" checks
+    share_with_nobody
     # The script's own log (FKS_ROOT/var/log) is the one file a dry run may write.
     find "$@" -path "$R/var/log" -prune -o -printf '%p %y %m %l\n' 2>/dev/null | LC_ALL=C sort
     find "$@" -path "$R/var/log" -prune -o -type f -exec md5sum {} + 2>/dev/null | LC_ALL=C sort
@@ -217,8 +226,8 @@ invoke() {
         upty)
             local cmdline drop=()
             cmdline="$(printf '%q ' "$STTY_BIN" rows "$PTY_ROWS" cols "$PTY_COLS"); $(printf '%q ' "${cmd[@]}")"
+            share_with_nobody
             if (( EUID == 0 )); then
-                chmod -R a+rwX "$T"
                 drop=("$SETPRIV_BIN" --reuid=65534 --regid=65534 --clear-groups --)
             fi
             feed_pty_input "$PTY_INPUT" \
@@ -227,8 +236,8 @@ invoke() {
             RC=${PIPESTATUS[1]}
             ;;
         user)
+            share_with_nobody
             if (( EUID == 0 )); then
-                chmod -R a+rwX "$T"
                 ( cd "$T/cwd" && "$SETPRIV_BIN" --reuid=65534 --regid=65534 --clear-groups -- \
                     "$SETSID_BIN" -w "${cmd[@]}" ) </dev/null 2>&1 | cat > "$T/raw.txt"
             else
