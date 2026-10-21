@@ -1448,7 +1448,13 @@ sc_root_no_user() {
         expect_out "Can't tell whose KDE PIM/LibreOffice data to clean up"
     else
         expect_rc 0
-        expect_out "user '(root|tester)'"
+        if (( EUID == 0 )); then
+            # Dry run as plain root: warns, then previews without a user.
+            expect_out_fixed "(dry-run) Refusing to clean root's home."
+            expect_out "user 'unknown'"
+            expect_out_fixed "(dry-run) Can't tell whose KDE PIM/LibreOffice data to clean up."
+        fi
+        expect_no_action '^rm '
     fi
 }
 
@@ -2214,6 +2220,7 @@ expect_menu_shown() {
     check "alternate screen entered" grep -q $'\e\\[?1049h' "$T/raw.txt"
     check "cursor hidden in the menu" grep -q $'\e\\[?25l' "$T/raw.txt"
     check "alternate screen left and cursor shown again" last_screen_restored
+    check "reverse video always reset on the same line" reverse_video_reset
 }
 
 last_screen_restored() {  # the last alternate-screen / cursor / mouse sequences restore the terminal
@@ -2495,26 +2502,32 @@ sc_menu_click_toggle() {
     menu_machine
     PTY_INPUT='q'
     invoke --no-reboot
-    local fw why
+    local fw
     fw=$(frame_row 'Firmware updates')
-    why=$(frame_row 'Picks the fastest mirror')
     check "Firmware row found on the first screen (row $fw)" test "$fw" -gt 0
-    check "DNF explanation line found on the first screen (row $why)" test "$why" -gt 0
     PTY_INPUT=$(keys n "$(click "$fw")" "$KEY_END" "$ENTER")$START_NO
     invoke --no-reboot
     expect_rc 0
     expect_review_only 'Firmware updates'
     expect_nothing_changed
-    # The highlighted step's explanation line belongs to that step.
-    PTY_INPUT=$(keys n "$(click "$why")" "$KEY_END" "$ENTER")$START_NO
-    invoke --no-reboot
-    expect_review_only 'Faster DNF downloads'
     # Clicking the same row twice selects and unselects.
     PTY_INPUT=$(keys n "$(click "$fw")" "$(click "$fw")" "$KEY_END" "$ENTER" q)
     invoke --no-reboot
     expect_rc 0
     expect_out_fixed 'Select at least one step first'
     expect_no_out 'Ready to start'
+    # In a big window every step shows its explanation under it; a click there counts too.
+    PTY_ROWS=50 PTY_COLS=120
+    PTY_INPUT='q'
+    invoke --no-reboot
+    local why fw_why
+    why=$(frame_row 'Picks the fastest mirror')
+    fw_why=$(frame_row 'Installs BIOS/UEFI and device firmware updates')
+    check "explanation lines found at 120x50 (rows $why, $fw_why)" test "$why" -gt 0 -a "$fw_why" -gt 0
+    PTY_INPUT=$(keys n "$(click "$fw_why")" "$KEY_END" "$ENTER")$START_NO
+    invoke --no-reboot
+    expect_review_only 'Firmware updates'
+    PTY_ROWS=24 PTY_COLS=80
     # A scrolled menu (18 rows): rows still map to the right steps.
     PTY_ROWS=18 PTY_COLS=60
     PTY_INPUT='q'
@@ -2569,6 +2582,120 @@ sc_menu_modified_arrows() {
     PTY_INPUT=$(keys n "$PG_DOWN" "$PG_UP" "$ENTER" "$KEY_END" "$ENTER")$START_NO
     invoke --no-reboot
     expect_review_only 'Faster DNF downloads'
+}
+
+scenario menu_info_line "pty" "Menu at 80x24: the highlighted step's explanation is one 'ℹ' line above Continue; a message takes its place"
+sc_menu_info_line() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT=$(keys n "$KEY_END" "$ENTER" q)
+    invoke --no-reboot
+    expect_rc 0
+    local frame info cont
+    frame=$(first_frame)
+    info=$(frame_row 'ℹ Picks the fastest mirror')
+    cont=$(frame_row 'Continue with 5 selected steps')
+    check "ℹ line for the highlighted step right above Continue (rows $info, $cont)" \
+        test "$info" -gt 0 -a "$cont" -eq $(( info + 1 ))
+    check "explanations are not under the step rows" not grep -q '^        Picks the fastest mirror' <<<"$frame"
+    expect_out 'ℹ Shows a summary of what will happen; nothing changes until you confirm\.'
+    expect_out_fixed 'Select at least one step first'
+    # Every redraw has the same height, message or not, so rows never move under the mouse.
+    check "all menu frames have the same height" test "$(frame_heights | sort -u | wc -l)" -eq 1
+}
+
+frame_heights() {  # newline count of each menu redraw
+    local raw frame
+    raw=$(<"$T/raw.txt")
+    raw=${raw#*$'\e[?1049h'}
+    raw=${raw%$'\e[?1049l'*}
+    while [[ $raw == *$'\e[H\e[2J'* ]]; do
+        raw=${raw#*$'\e[H\e[2J'}
+        frame=${raw%%$'\e[H\e[2J'*}
+        printf '%s' "$frame" | tr -cd '\n' | wc -c
+    done
+}
+
+scenario menu_window_too_small "pty" "Menu in a 25-column window: 'Window too small.'; q still quits, nothing changed"
+sc_menu_window_too_small() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_ROWS=24 PTY_COLS=25
+    PTY_INPUT='q'
+    invoke --no-reboot
+    expect_rc 0
+    expect_out '^Window too small\.$'
+    expect_out_fixed 'Make it bigger, or press q to quit.'
+    expect_no_out 'Continue with'
+    expect_out_fixed 'Nothing was changed.'
+    check "terminal restored" last_screen_restored
+    # Very short but wide enough: the overview and key help go, the steps stay usable.
+    PTY_ROWS=10 PTY_COLS=80
+    PTY_INPUT=$(keys n "$ENTER" "$KEY_END" "$ENTER")$START_NO
+    invoke --no-reboot
+    expect_rc 0
+    expect_frames_fit_rows 10
+    expect_no_out 'Window too small'
+    expect_review_only 'Faster DNF downloads'
+}
+
+scenario menu_esc_combo "pty" "Menu: Esc followed quickly by another key (or Esc twice) quits"
+sc_menu_esc_combo() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT='\ex'
+    invoke --no-reboot
+    expect_rc 0
+    expect_out_fixed 'Nothing was changed.'
+    expect_no_out 'Ready to start'
+    PTY_INPUT='\e\e'
+    invoke --no-reboot
+    expect_rc 0
+    expect_out_fixed 'Nothing was changed.'
+    expect_no_out 'Ready to start'
+}
+
+scenario term_dumb "pty dry" "TERM=dumb: no colours; the checklist is refused (dry run previews everything instead)"
+sc_term_dumb() {
+    AUTO_ALL=0
+    RUN_ENV+=(TERM=dumb)
+    if [[ $MODE == pty ]]; then
+        invoke --no-reboot
+        expect_rc nonzero
+        expect_out_fixed "This terminal (TERM=dumb) can't show the checklist. Choose steps with --only ... or --all (see --list-steps)."
+        check "no checklist screen" not grep -q $'\e\\[?1049h' "$T/raw.txt"
+        check "no colour codes" no_colour_codes
+        expect_nothing_changed
+        # Steps chosen with flags still work there.
+        invoke --only dnf --yes --no-reboot
+        expect_success
+        check "no colour codes with --only" no_colour_codes
+    else
+        invoke --dry-run --no-reboot
+        expect_rc 0
+        expect_out 'No terminal for the checklist: previewing every step'
+    fi
+}
+
+scenario no_color "pty" "NO_COLOR set: no colour codes, the checklist still works"
+sc_no_color() {
+    AUTO_ALL=0
+    menu_machine
+    RUN_ENV+=(NO_COLOR=1)
+    PTY_INPUT=$(keys n "$ENTER" "$KEY_END" "$ENTER")$START_YES
+    invoke --no-reboot
+    expect_success
+    expect_review_only 'Faster DNF downloads'
+    check "no colour codes" no_colour_codes
+    check "menu still shown (alternate screen)" grep -q $'\e\\[?1049h' "$T/raw.txt"
+    # The highlight is reverse video; it must be switched off again on the same line,
+    # or the rest of the screen is drawn inverted.
+    check "reverse video always reset on the same line" reverse_video_reset
+}
+
+no_colour_codes() { ! grep -aq $'\e\\[[0-9;]*3[0-9]m' "$T/raw.txt"; }
+reverse_video_reset() {
+    ! sed 's/\r$//' "$T/raw.txt" | grep -a $'\e\\[7m' | grep -Eavq $'\e\\[7m.*\e\\[(0|27)?m'
 }
 
 scenario menu_toggle_off "pty" "Menu: Space twice unselects; nothing selected -> message"

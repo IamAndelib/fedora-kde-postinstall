@@ -181,9 +181,13 @@ invoke() {
     fi
     : > "$CALLS"
 
+    # A terminal has a TERM (the script treats a missing one as "dumb": no colours, no
+    # checklist). Scenarios can override it, or set NO_COLOR, through RUN_ENV.
+    local term=()
+    [[ $MODE == pty || $MODE == upty ]] && term=(TERM=xterm-256color)
     local envv=(
         "PATH=$STUBDIR:$SAFEBIN" "FKS_ROOT=$R" "FKS_STATE=$S" "FKS_CALLS=$CALLS"
-        "TMPDIR=$T/tmp" "HOME=$T/invoker-home" LANG=C "${RUN_ENV[@]}"
+        "TMPDIR=$T/tmp" "HOME=$T/invoker-home" LANG=C "${term[@]}" "${RUN_ENV[@]}"
     )
     local cmd=("$ENV_BIN" -i "${envv[@]}" "$BASH_BIN" "${SCRIPT_UNDER_TEST:-$SCRIPT}" "${args[@]}")
     local guard=()
