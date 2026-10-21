@@ -532,7 +532,9 @@ take_lock() {
 }
 
 preflight() {
-    section "Preflight checks"
+    printf '\n%sFedora KDE post-install setup %s%s\n' "$C_BOLD" "$SCRIPT_VERSION" "$C_RESET"
+    printf 'Checks your computer, shows what is already done, and lets you choose what to do next.\n'
+    section "Checking your system"
 
     if (( EUID != 0 && ! STATUS_ONLY )); then
         require "Run this with sudo: sudo bash $0"
@@ -631,7 +633,7 @@ has_wireless_phy() {  # $1 = sysfs dir; true if a kernel driver already register
 }
 
 detect_system() {
-    section "Detecting hardware"
+    section "Your hardware"
 
     CPU_MODEL=$(lscpu 2>/dev/null | awk -F: '/^Model name/ { sub(/^[ \t]+/, "", $2); print $2; exit }' || true)
     CPU_VENDOR=$(lscpu 2>/dev/null | awk -F: '/^Vendor ID/ { sub(/^[ \t]+/, "", $2); print $2; exit }' || true)
@@ -1379,10 +1381,17 @@ choose_steps_menu() {
     if (( ${#items[@]} == 0 )); then
         print_overview
         printf '\n  %sEverything that applies to this computer is already done.%s\n' "$C_GREEN" "$C_RESET"
-        printf '  To redo a step anyway: sudo bash %s --only <step> --force   (see --list-steps)\n' "$0"
+        printf '  To redo a step anyway, run the setup again with: --only <step> --force   (see --list-steps)\n'
         exit 0
     fi
     local cur=0 n=$(( ${#items[@]} + 2 )) key rest msg="" id rc
+    # Smart default: everything recommended that isn't done yet starts selected.
+    for id in "${items[@]}"; do
+        if [[ ${STEP_TAG[$id]} == recommended ]] && wants_doing "$id"; then
+            select_step "$id"
+        fi
+    done
+    resolve_dependencies
     MENU_ACTIVE=1
     # Alternate screen (like less/htop), so the menu doesn't fill the scrollback.
     printf '\e[?1049h\e[?25l' >/dev/tty
@@ -2551,6 +2560,11 @@ main() {
     if (( LIST_STEPS )); then
         print_step_list
         exit 0
+    fi
+    # Started without sudo from a terminal: ask for it instead of failing.
+    if (( EUID != 0 && ! DRY_RUN )) && [[ -f $0 && -r $0 ]] && command -v sudo &>/dev/null && have_tty; then
+        printf 'The setup needs administrator rights: enter your password if asked (nothing shows while you type).\n'
+        exec sudo bash -- "$0" "$@"
     fi
     setup_logging "$@"
     preflight

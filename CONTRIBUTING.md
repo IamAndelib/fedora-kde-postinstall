@@ -6,6 +6,7 @@ Thanks for helping. This script runs as root on people's fresh installs, so ever
 
 ```
 fedora-kde-setup.sh          the script (a single file)
+install.sh                   one-line launcher: downloads a pinned release, verifies it, runs it
 fedora-kde-setup.sh.sha256   its checksum; CI fails if this doesn't match
 docs/                        user documentation
 tests/run.sh                 stubbed scenario suite (no real system changes)
@@ -44,3 +45,9 @@ Environment variables starting with `FKS_` (mainly `FKS_ROOT`, which points the 
 - Update the checksum: `sha256sum fedora-kde-setup.sh > fedora-kde-setup.sh.sha256`.
 - Update the docs (`README.md`, `docs/`) if behaviour visible to users changed.
 - Add a line to `CHANGELOG.md`.
+
+## Making a release
+
+1. Bump `SCRIPT_VERSION` in the script and regenerate the checksum.
+2. Set the default `REF` in `install.sh` and the manual-download links in `README.md`/`SECURITY.md` to the new tag (for example `v1.3.0`).
+3. Merge to `main`, then publish a GitHub release with that tag, targeting the merge commit. The one-line installer picks it up immediately.

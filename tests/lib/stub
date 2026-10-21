@@ -15,6 +15,7 @@
 #   desktop_pkgs    packages whose "rpm -ql" lists a .desktop file
 #   remove_extra    "TRIGGER PKG..." lines: a "remove ... --assumeno" that includes
 #                   TRIGGER (or any remove, for TRIGGER "*") also lists PKG...
+#   remove_extra_late  the same, but only from the second plan of that removal on
 #   units           systemd units "systemctl cat" finds
 #   enabled_units   units "systemctl is-enabled" reports enabled ("enable" adds to it)
 #   modules         "KERNEL MODULE" lines: kernel modules that exist (akmods adds to it)
@@ -204,16 +205,23 @@ stub_dnf() {
                     echo "Error: Failed to obtain rpm transaction lock. Another transaction is in progress."
                     return 1
                 fi
-                local pkgs=("${ops[@]}") trigger extra
-                if [[ -f $state/remove_extra ]]; then
+                local pkgs=("${ops[@]}") trigger extra f n=0
+                # remove_extra_late only applies from the second plan of the same removal
+                # on (i.e. at run time, after the review screen planned it once).
+                local key=${ops[0]}
+                n=$(grep -cxF -- "$key" "$state/assumeno_seen" 2>/dev/null || true)
+                printf '%s\n' "$key" >> "$state/assumeno_seen"
+                for f in remove_extra remove_extra_late; do
+                    [[ -f $state/$f ]] || continue
+                    [[ $f == remove_extra_late ]] && (( n < 1 )) && continue
                     while read -r trigger extra; do
                         [[ -n $trigger ]] || continue
                         if [[ $trigger == "*" ]] || printf '%s\n' "${ops[@]}" | grep -qxF -- "$trigger"; then
                             read -ra extra <<< "$extra"
                             pkgs+=("${extra[@]}")
                         fi
-                    done < "$state/remove_extra"
-                fi
+                    done < "$state/$f"
+                done
                 transaction_table "${pkgs[@]}"
                 return 1
             fi

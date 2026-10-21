@@ -88,7 +88,7 @@ readonly STEP_IDS_RE='(dnf|update|codecs|drivers|pim|libreoffice|flathub|firmwar
 # Finished steps are recorded as "ID DATE" lines; the summary ends with a 100% line.
 expect_success() {
     expect_rc 0
-    expect_out 'Finished: [0-9]+ of [0-9]+ steps done'
+    expect_out 'All [0-9]+ steps? finished\.|[0-9]+ of [0-9]+ steps finished; [0-9]+ needs? attention \(see below\)\.'
     if is_live; then
         check "state file has only 'ID DATE' lines" \
             not grep -Evq "^$STEP_IDS_RE [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}$" "$(state_file)"
@@ -107,13 +107,27 @@ expect_success() {
 expect_recorded()     { check "step '$1' recorded as done" grep -q "^$1 2026-01-02 03:04:05$" "$(state_file)"; }
 expect_not_recorded() { check "step '$1' not recorded" not grep -qs "^$1 2026-01-02" "$(state_file)"; }
 
-# The "Will do:" list printed before running.
-will_do() { sed -n '/^  Will do:$/,/^$/p' "$OUT"; }
+# The review list printed before running ("Ready to start N steps ...:").
+will_do() {
+    awk '/^  Ready to start [0-9]+ steps?/ { f = 1; seen = 0; next }
+         f && /^$/ { if (seen) f = 0; next }
+         f { seen = 1; print }' "$OUT"
+}
+readonly START_YES='|WAIT:Start these|y\n' START_NO='|WAIT:Start these|n\n'
+readonly ALL_AND_REMOVALS='dnf,update,codecs,flathub,firmware,maintenance,pim,libreoffice'
+# Steps marker on the screen before which something must have happened.
+expect_out_before() {  # RE1 RE2: first output line matching RE1 comes before RE2's
+    check "output /$1/ comes before /$2/" \
+        test "$(first_line "$1" "$OUT")" -lt "$(first_line "$2" "$OUT")"
+}
 expect_will_do()    { check "Will do lists '$1'" grep -Fq -- "$1" <(will_do); }
 expect_no_will_do() { check "Will do doesn't list '$1'" not grep -Fq -- "$1" <(will_do); }
 
-expect_no_pkg_change() {
-    expect_no_call '^dnf5? ([^ ]+ )*(install|remove|upgrade|swap|config-manager|group)( |$)'
+pkg_change_calls() {
+    grep -v -- --assumeno "$CALLS" | grep -Eq '^dnf5? ([^ ]+ )*(install|remove|upgrade|swap|config-manager|group)( |$)'
+}
+expect_no_pkg_change() {  # planning with --assumeno is fine
+    check "no package-changing dnf call" not pkg_change_calls
 }
 
 expect_untouched() {  # a run that must stop before changing anything
@@ -169,16 +183,12 @@ expect_home_cleaned() {  # HOME
     expect_suite_deleted "$1" LibreOffice "${#FX_OFFICE_JUNK[@]}"
 }
 
-expect_pim_data_kept() {  # PIM step skipped, LibreOffice removed
+expect_pim_data_kept() {  # PIM not removed (unselected or failed), LibreOffice removed
     expect_kept "$H" "${FX_PIM_JUNK[@]}"
     expect_deleted "$H" "${FX_OFFICE_JUNK[@]}"
     expect_rm_count "$H" "${#FX_OFFICE_JUNK[@]}"
-    expect_out_fixed "Kept KDE PIM data in $H because KDE PIM is still installed"
     expect_suite_deleted "$H" LibreOffice "${#FX_OFFICE_JUNK[@]}"
-    if is_live; then
-        expect_not_recorded pim
-        expect_out 'Not completed \(see warnings\):'
-    fi
+    if is_live; then expect_not_recorded pim; fi
 }
 
 expect_home_intact() {  # HOME
@@ -211,7 +221,7 @@ scenario intel_laptop "dry live" "Intel iGPU + Intel Wi-Fi laptop: full happy pa
 sc_intel_laptop() {
     fx_gpu_intel; fx_wifi_intel; fx_wifi_phy 0000:00:14.3; fx_battery
     fx_add installed libva-intel-media-driver
-    invoke --yes --no-reboot
+    invoke --only "$ALL_AND_REMOVALS" --yes --no-reboot
     expect_success
     expect_out 'Form factor +laptop'
     expect_out 'Secure Boot +disabled'
@@ -281,7 +291,8 @@ sc_intel_laptop() {
         local id
         for id in dnf update codecs pim libreoffice flathub firmware maintenance; do expect_recorded "$id"; done
         expect_not_recorded drivers
-        expect_out 'Finished: 8 of 8 steps done'
+        expect_out 'All 8 steps finished\.'
+        expect_out '^  ✔ Step 8 of 8 done'
         expect_out_fixed "Log: $R/var/log/fedora-kde-setup.log"
         check "root log is mode 600" test "$(stat -c %a "$R/var/log/fedora-kde-setup.log")" = 600
     fi
@@ -379,7 +390,7 @@ sc_nvidia_turing_sb() {
     fx_gpu_nvidia "${NV_TU106[@]}"
     fx_conf FKS_SB=enabled
     if [[ $MODE == pty ]]; then
-        PTY_INPUT='y\n'
+        PTY_INPUT=$START_YES
         invoke --no-reboot
     else
         invoke --yes --no-reboot
@@ -399,6 +410,8 @@ sc_nvidia_turing_sb() {
         expect_no_call 'generate-hash|--hash-file|^openssl'
         expect_out 'akmods signing key queued for enrollment'
         expect_out 'Type the one-time password you just created'
+        # The password is asked before the long part starts.
+        expect_out_before '^== Secure Boot key \(before the long part\)$' 'Step 1 of'
     fi
 }
 
@@ -501,7 +514,7 @@ scenario nvidia_sb_tty_fails "pty" "MOK import fails 3 times on a terminal: driv
 sc_nvidia_sb_tty_fails() {
     fx_gpu_nvidia "${NV_TU106[@]}"
     fx_conf FKS_SB=enabled FKS_MOK_IMPORT_RC=1
-    PTY_INPUT='y\n'
+    PTY_INPUT=$START_YES
     invoke --no-reboot
     expect_success
     check "mokutil --import tried 3 times (got $(count_calls '^mokutil --import'))" \
@@ -802,10 +815,10 @@ scenario container_pty "pty" "Container on a terminal: confirm, but never offer 
 sc_container_pty() {
     touch "$R/run/.containerenv"
     fx_conf FKS_CONTAINER_VIRT=podman
-    PTY_INPUT='y\n'
+    PTY_INPUT=$START_YES
     invoke
     expect_success
-    expect_out 'Proceed\? \[y/N\]'
+    expect_out 'Start these [0-9]+ steps? now\? \[y/N\]'
     expect_no_out 'Reboot now'
     expect_no_call '^systemctl (mask|unmask|stop|enable|restart|reboot)'
 }
@@ -932,7 +945,12 @@ sc_upgrade_fails() {
     EXPECT_ERRTRAP=1
     invoke --yes --no-reboot
     expect_rc nonzero
-    expect_out 'Failed \(exit 1\) at line [0-9]+ in run <- step_update <- run_steps <- main: dnf5 upgrade --refresh -y$'
+    expect_out_fixed 'Error: this command failed (exit code 1): dnf5 upgrade --refresh -y'
+    expect_no_out 'for bug reports'
+    check "technical error line only in the log" "${ROOTCMD[@]}" grep -Eq \
+        '^ERROR \(for bug reports\): exit 1 at line [0-9]+ in run <- step_update <- run_steps <- main: dnf5 upgrade --refresh -y$' \
+        "$R/var/log/fedora-kde-setup.log"
+    expect_out_fixed 'The script stopped during step 2 of 6 (Full system update).'
     expect_no_file "$R/var/lib/fedora-kde-setup/done"
     expect_call '^systemctl unmask --runtime packagekit.service$'
     expect_no_action '^dnf5 remove -y'
@@ -943,7 +961,10 @@ sc_interrupted() {
     fx_conf 'FKS_SIGINT_ON=^dnf5 upgrade --refresh'
     invoke --yes --no-reboot
     expect_rc nonzero
-    expect_out 'xx Interrupted'
+    expect_out_fixed 'Error: Stopped by Ctrl-C'
+    expect_out_fixed 'The script stopped during step 2 of 6 (Full system update).'
+    expect_out_fixed '  Finished before that: Faster DNF downloads'
+    expect_out_fixed '  Running the script again is safe: it shows what is done and skips it.'
     expect_call '^systemctl unmask --runtime packagekit.service$'
     expect_no_file "$R/var/lib/fedora-kde-setup/done"
     expect_no_action '^dnf5 remove -y'
@@ -1083,9 +1104,11 @@ sc_pim_absent() {
 scenario removal_guard "dry live" "PIM removal would take plasma-workspace: PIM skipped, LibreOffice removed"
 sc_removal_guard() {
     fx_add remove_extra 'kmail plasma-workspace sddm libfoo'
-    invoke --yes --no-reboot
+    invoke --only pim,libreoffice --yes --no-reboot
     expect_success
-    expect_out 'Skipped removing KDE PIM: it would also remove core desktop packages \(plasma-workspace sddm\)'
+    expect_out_fixed 'Removing KDE PIM would also remove core desktop parts (plasma-workspace sddm); unselected it'
+    expect_no_will_do 'Remove KDE PIM'
+    expect_will_do 'Remove LibreOffice'
     expect_no_action "^dnf5 remove -y $PIM_SORTED$"
     expect_action "^dnf5 remove -y $OFFICE_SORTED$"
     expect_pim_data_kept
@@ -1094,15 +1117,15 @@ sc_removal_guard() {
 scenario office_guard "dry live" "LibreOffice removal would take plasma-desktop: its settings kept, PIM data deleted"
 sc_office_guard() {
     fx_add remove_extra 'libreoffice-core plasma-desktop'
-    invoke --yes --no-reboot
+    invoke --only pim,libreoffice --yes --no-reboot
     expect_success
-    expect_out 'Skipped removing LibreOffice: it would also remove core desktop packages \(plasma-desktop\)'
+    expect_out_fixed 'Removing LibreOffice would also remove core desktop parts (plasma-desktop); unselected it'
     expect_action "^dnf5 remove -y $PIM_SORTED$"
     expect_no_action "^dnf5 remove -y $OFFICE_SORTED$"
     expect_deleted "$H" "${FX_PIM_JUNK[@]}"
     expect_kept "$H" "${FX_OFFICE_JUNK[@]}"
     expect_rm_count "$H" "${#FX_PIM_JUNK[@]}"
-    expect_out_fixed "Kept LibreOffice data in $H because LibreOffice is still installed"
+    expect_no_will_do 'Remove LibreOffice'
     expect_suite_deleted "$H" "KDE PIM" "${#FX_PIM_JUNK[@]}"
     if is_live; then expect_recorded pim; expect_not_recorded libreoffice; fi
 }
@@ -1110,9 +1133,11 @@ sc_office_guard() {
 scenario remove_fails "live" "dnf5 remove -y fails for KDE PIM: warning, PIM data kept, run completes"
 sc_remove_fails() {
     fx_add fail '^dnf5 remove -y akonadi'
-    invoke --yes --no-reboot
+    invoke --only pim,libreoffice --yes --no-reboot
     expect_success
     expect_out 'Removing KDE PIM failed'
+    expect_out_fixed "Kept KDE PIM data in $H because KDE PIM is still installed"
+    expect_out 'Not completed \(see warnings\):'
     expect_action "^dnf5 remove -y $OFFICE_SORTED$"
     expect_pim_data_kept
 }
@@ -1120,7 +1145,7 @@ sc_remove_fails() {
 scenario removal_guard_uninstalled "dry" "Protected name in the transaction but not installed: not counted"
 sc_removal_guard_uninstalled() {
     fx_add remove_extra 'kmail plasma-login-manager'
-    invoke --yes --no-reboot
+    invoke --only pim --yes --no-reboot
     expect_success
     expect_no_out 'core desktop packages'
     expect_action "^dnf5 remove -y $PIM_SORTED$"
@@ -1129,62 +1154,46 @@ sc_removal_guard_uninstalled() {
 scenario removal_plan_error "dry live" "dnf5 can't plan the removal (lock error): both batches skipped"
 sc_removal_plan_error() {
     fx_conf FKS_DNF_PLAN_ERROR=1
-    invoke --yes --no-reboot
+    invoke --only pim,libreoffice,maintenance --yes --no-reboot
     expect_success
-    expect_out "Skipped removing KDE PIM: dnf couldn't plan it \\(.*transaction lock"
-    expect_out "Skipped removing LibreOffice: dnf couldn't plan it"
+    expect_out "Removing KDE PIM isn't possible right now \\(dnf: .*transaction lock.*\\); unselected it"
+    expect_out "Removing LibreOffice isn't possible right now \\(dnf: .*\\); unselected it"
+    expect_no_will_do 'Remove'
+    if is_live; then expect_recorded maintenance; fi
     expect_no_action '^dnf5 remove -y'
     expect_kept "$H" "${FX_JUNK[@]}"
     expect_rm_count "$H" 0
 }
 
-scenario kgpg_cascade_yes "dry live" "PIM removal would take kgpg (an app): skipped with --yes, LibreOffice removed"
+scenario kgpg_cascade_yes "dry live" "PIM removal would take kgpg (an app): --yes unselects PIM up front, LibreOffice removed"
 sc_kgpg_cascade_yes() {
     fx_add remove_extra 'kmail kgpg'
-    invoke --yes --no-reboot
+    invoke --only pim,libreoffice --yes --no-reboot
     expect_success
-    expect_out 'Removing KDE PIM also removes these apps, which use its libraries: kgpg$'
-    expect_action "^dnf5 remove -y $OFFICE_SORTED$"
-    if is_live; then
-        expect_out 'Skipped removing KDE PIM to keep those apps'
-        expect_no_action "^dnf5 remove -y $PIM_SORTED$"
-        expect_pim_data_kept
-    else
-        expect_out 'a real run asks before removing them, or skips with --yes'
-        expect_action "^dnf5 remove -y $PIM_SORTED$"
-        expect_home_cleaned "$H"
-    fi
-}
-
-scenario kgpg_cascade_tty_yes "pty" "kgpg cascade on a terminal, answered y: PIM removed"
-sc_kgpg_cascade_tty_yes() {
-    fx_add remove_extra 'kmail kgpg'
-    PTY_INPUT='y\ny\n'
-    invoke --no-reboot
-    expect_success
-    expect_out 'Remove them too\? \[y/N\]'
-    expect_action "^dnf5 remove -y $PIM_SORTED$"
-    expect_action "^dnf5 remove -y $OFFICE_SORTED$"
-    expect_home_cleaned "$H"
-}
-
-scenario kgpg_cascade_tty_no "pty" "kgpg cascade on a terminal, answered n: PIM skipped"
-sc_kgpg_cascade_tty_no() {
-    fx_add remove_extra 'kmail kgpg'
-    PTY_INPUT='y\nn\n'
-    invoke --no-reboot
-    expect_success
-    expect_out 'Remove them too\? \[y/N\]'
-    expect_out 'Skipped removing KDE PIM$'
+    expect_out_fixed 'Removing KDE PIM would also remove kgpg; unselected it (--yes never removes extra apps)'
+    expect_no_will_do 'Remove KDE PIM'
     expect_no_action "^dnf5 remove -y $PIM_SORTED$"
     expect_action "^dnf5 remove -y $OFFICE_SORTED$"
     expect_pim_data_kept
 }
 
+scenario kgpg_appears_late "live" "An app joins the PIM transaction after the review: PIM skipped at run time, data kept"
+sc_kgpg_appears_late() {
+    fx_add remove_extra_late 'kmail kgpg'
+    invoke --only pim,libreoffice --yes --no-reboot
+    expect_success
+    expect_will_do 'Remove KDE PIM'
+    expect_out_fixed "Skipped removing KDE PIM: it would now also remove kgpg, which wasn't on the review screen."
+    expect_out_fixed "Kept KDE PIM data in $H because KDE PIM is still installed"
+    expect_no_action "^dnf5 remove -y $PIM_SORTED$"
+    expect_pim_data_kept
+    expect_out '1 of 2 steps finished; 1 needs attention'
+}
+
 scenario pim_running "dry live" "PIM processes running: pkill (pattern and akonadi db) before removal"
 sc_pim_running() {
     fx_conf FKS_PIM_RUNNING=1
-    invoke --yes --no-reboot
+    invoke --only pim --yes --no-reboot
     expect_success
     expect_action_line "pkill -u tester $PIM_PROC_RE"
     expect_action_line 'pkill -u tester -f akonadi/(mysql\.conf|db_data)'
@@ -1201,7 +1210,7 @@ sc_session_bus() {
         printf 'LANG="de_DE.UTF-8"\n' > "$R/etc/locale.conf"
         lang=de_DE.UTF-8
     fi
-    invoke --yes --no-reboot
+    invoke --only pim,libreoffice --yes --no-reboot
     expect_success
     expect_action_line "$(as_user_prefix) env XDG_RUNTIME_DIR=$rt DBUS_SESSION_BUS_ADDRESS=unix:path=$rt/bus akonadictl stop"
     expect_action_line "$(as_user_prefix) env -u LC_ALL LANG=$lang XDG_RUNTIME_DIR=$rt DBUS_SESSION_BUS_ADDRESS=unix:path=$rt/bus kbuildsycoca6 --noincremental"
@@ -1211,7 +1220,7 @@ sc_session_bus() {
 
 scenario user_junk "dry live" "Home cleanup deletes exactly the listed paths (symlink not followed)"
 sc_user_junk() {
-    invoke --yes --no-reboot
+    invoke --only pim,libreoffice --yes --no-reboot
     expect_success
     expect_home_cleaned "$H"
 }
@@ -1279,7 +1288,7 @@ sc_fwupd_refresh_fails() {
     expect_out "Couldn't refresh firmware metadata"
     expect_no_out 'Firmware already up to date'
     expect_not_recorded firmware
-    expect_out 'Finished: 0 of 1 steps done'
+    expect_out '0 of 1 steps finished; 1 needs attention'
 }
 
 scenario kernel_update "live" "Upgrade pulls a new kernel: modules built for it"
@@ -1344,26 +1353,31 @@ sc_no_tty_no_yes() {
 
 scenario tty_confirm_yes "pty" "Terminal: answer y, then accept the reboot default (stubbed systemctl)"
 sc_tty_confirm_yes() {
-    PTY_INPUT='y\n\n'
+    PTY_INPUT="$START_YES|WAIT:Reboot now|\n"
     EXPECT_REBOOT=1
     invoke
     expect_success
-    expect_out 'Proceed\? \[y/N\]'
+    expect_out 'Start these [0-9]+ steps now\? \[y/N\]'
+    expect_out_fixed 'Save your work in other apps first.'
     expect_out 'Reboot now\? \(recommended\) \[Y/n\]'
     expect_call '^systemctl reboot$'
 }
 
-scenario tty_confirm_no "pty" "Terminal: answer n, nothing changes"
+scenario tty_confirm_no "pty" "Terminal: answer n at the review: nothing changes, exit 0"
 sc_tty_confirm_no() {
-    PTY_INPUT='n\n'
+    PTY_INPUT=$START_NO
     invoke --no-reboot
-    expect_untouched
-    expect_out 'Aborted, nothing was changed'
+    expect_rc 0
+    expect_out '^Nothing was changed\.$'
+    expect_no_pkg_change
+    expect_no_call '^systemctl (mask|enable|restart)'
+    expect_no_file "$(state_file)"
+    expect_count "$R/etc/dnf/dnf.conf" 'fastestmirror' 0
 }
 
 scenario tty_no_reboot "pty" "Terminal + --no-reboot: no reboot prompt"
 sc_tty_no_reboot() {
-    PTY_INPUT='y\n'
+    PTY_INPUT=$START_YES
     invoke --no-reboot
     expect_success
     expect_no_out 'Reboot now'
@@ -1373,7 +1387,7 @@ scenario assume_yes "live" "--yes without --no-reboot: never prompts or reboots"
 sc_assume_yes() {
     invoke --yes
     expect_success
-    expect_no_out 'Proceed\?'
+    expect_no_out 'Start these'
     expect_no_out 'Reboot now'
     expect_out 'A reboot is recommended'
 }
@@ -1384,7 +1398,7 @@ sc_assume_yes() {
 scenario root_no_user "dry live" "Plain root, no SUDO_USER/--user, PIM selected: real run dies"
 sc_root_no_user() {
     RUN_ENV=()
-    invoke --yes --no-reboot
+    invoke --only pim --yes --no-reboot
     if is_live; then
         expect_untouched
         expect_out "Can't tell whose KDE PIM/LibreOffice data to clean up"
@@ -1392,6 +1406,15 @@ sc_root_no_user() {
         expect_rc 0
         expect_out "user '(root|tester)'"
     fi
+}
+
+scenario root_no_user_all "live" "Plain root, no user: --all works (it never removes apps)"
+sc_root_no_user_all() {
+    RUN_ENV=()
+    invoke --all --yes --no-reboot
+    expect_success
+    expect_no_out "Can't tell whose"
+    expect_recorded maintenance
 }
 
 scenario root_no_user_update "live" "Plain root, no user: --only update works (no user data involved)"
@@ -1408,7 +1431,7 @@ sc_root_no_user_update() {
 scenario sudo_user_root "live" "SUDO_USER=root (sudo from a root shell), PIM selected: real run dies"
 sc_sudo_user_root() {
     RUN_ENV=(SUDO_USER=root)
-    invoke --yes --no-reboot
+    invoke --only pim --yes --no-reboot
     expect_untouched
     expect_out "Can't tell whose KDE PIM/LibreOffice data to clean up"
 }
@@ -1431,7 +1454,7 @@ sc_pkexec_root() {
 scenario pkexec_uid "dry live" "pkexec: PKEXEC_UID picks the user"
 sc_pkexec_uid() {
     RUN_ENV=("PKEXEC_UID=$FX_UID")
-    invoke --yes --no-reboot
+    invoke --only pim,libreoffice --yes --no-reboot
     expect_success
     expect_out "user 'tester'"
     expect_home_cleaned "$H"
@@ -1441,7 +1464,7 @@ scenario user_option "dry live" "--user tester overrides SUDO_USER=alice; alice'
 sc_user_option() {
     RUN_ENV=(SUDO_USER=alice)
     fx_home_junk "$T/home/alice"
-    invoke --user tester --yes --no-reboot
+    invoke --user tester --only pim,libreoffice --yes --no-reboot
     expect_success
     expect_out "user 'tester'"
     expect_home_cleaned "$H"
@@ -1459,7 +1482,7 @@ sc_user_eq_form() {
 
 scenario user_unknown "dry live" "--user ghost: real run dies, dry run warns and skips user data"
 sc_user_unknown() {
-    invoke --user ghost --yes --no-reboot
+    invoke --user ghost --only pim --yes --no-reboot
     if is_live; then
         expect_untouched
         expect_out "User 'ghost' doesn't exist"
@@ -1602,7 +1625,8 @@ sc_help() {
     EXPECT_NO_LOG=1
     invoke --help
     expect_rc 0
-    expect_out '^Usage: sudo bash fedora-kde-setup\.sh \[options\]$'
+    expect_out '^Examples:$'
+    expect_out '^  sudo bash fedora-kde-setup\.sh --all --yes '
     expect_out '--dry-run'
     expect_out '-V, --version'
     check "no command called" not test -s "$CALLS"
@@ -1622,7 +1646,8 @@ sc_bad_option() {
     EXPECT_NO_LOG=1
     invoke --bogus
     expect_rc nonzero
-    expect_out 'Unknown option: --bogus'
+    expect_out_fixed "Error: Unknown option '--bogus'. See --help."
+    expect_no_out 'Examples:'
     expect_no_dnf
 }
 
@@ -1693,7 +1718,7 @@ sc_dnfconf_no_main() {
 rail_refused() {  # MESSAGE_REGEX: real run dies before any change, dry run only warns
     if is_live; then
         expect_untouched
-        expect_out "xx $1"
+        expect_out "Error: $1"
     else
         expect_rc 0
         expect_out "\\(dry-run\\) $1"
@@ -1807,7 +1832,7 @@ sc_rails_order() {
 
 scenario user_bad_name "dry live" "--user 'Bad;Name': invalid user name refused"
 sc_user_bad_name() {
-    invoke --user 'Bad;Name' --yes --no-reboot
+    invoke --user 'Bad;Name' --only pim --yes --no-reboot
     expect_out_fixed "'Bad;Name' isn't a valid user name"
     expect_no_call 'Bad;Name'
     if is_live; then
@@ -1970,7 +1995,7 @@ sc_path_reset() {
         "FKS_CALLS=$CALLS" LANG=C "$BASH_BIN" "$SCRIPT" --help ) </dev/null > "$OUT" 2>&1
     RC=$?
     expect_rc 0
-    expect_out '^Usage: sudo bash fedora-kde-setup\.sh \[options\]$'
+    expect_out '^Examples:$'
     check "caller's PATH not used (decoy cat not called)" not test -s "$CALLS"
 
     ( cd "$T/cwd" && "$SETSID_BIN" -w "$ENV_BIN" -i "PATH=$fake:$SAFEBIN" "FKS_STATE=$S" \
@@ -2066,11 +2091,13 @@ sc_user_digits() {
 }
 
 # ===========================================================================
-# v1.2: choosing steps, status detection, progress, reboot advice
+# v1.2: choosing steps, the review screen, status detection, progress, reboot advice
 
-# The menu is keyboard-driven on /dev/tty. Base machine = Intel laptop; its selectable
-# rows are 0 dnf, 1 update, 2 codecs, 3 pim, 4 libreoffice, 5 flathub, 6 firmware,
-# 7 maintenance, then 8 "Continue", 9 "Quit" (drivers isn't needed there). Moving wraps.
+# The menu runs on /dev/tty in the alternate screen. Rows are grouped: RECOMMENDED,
+# OPTIONAL, REMOVE APPS. On the Intel laptop (drivers not needed) they are
+# 0 dnf, 1 update, 2 codecs, 3 flathub, 4 firmware, 5 maintenance, 6 pim, 7 libreoffice,
+# 8 "Continue", 9 "Quit". With an NVIDIA GPU, drivers is row 3 and the rest shift by one.
+# Moving wraps around.
 readonly UP='\e[A' DOWN='\e[B' ENTER='\n' SPACE=' '
 menu_machine() { fx_gpu_intel; fx_wifi_intel; fx_wifi_phy 0000:00:14.3; fx_battery; }
 keys() { local k out=""; for k in "$@"; do out+=$k; done; printf '%s' "$out"; }
@@ -2078,46 +2105,74 @@ rep_key() { local i out=""; for (( i = 0; i < $2; i++ )); do out+=$1; done; prin
 
 expect_menu_shown() {
     expect_out '^  Fedora KDE setup: choose what to do$'
-    expect_out '^  ✔ Already done on this computer$'
-    expect_out '^  Select what to do   ↑/↓ move · Enter/Space select · r recommended · a all · n none · q quit$'
-    expect_out '^      ▶ Continue with [0-9]+ selected steps?$|❯  ▶ Continue with'
+    expect_out '^  ✔ Already done: '
+    expect_out '^  RECOMMENDED$'
+    expect_out 'Continue with [0-9]+ selected steps?'
     expect_out 'Quit without changes'
-    check "cursor hidden during the menu" grep -q $'\e\\[?25l' "$T/raw.txt"
-    check "cursor shown again afterwards" grep -q $'\e\\[?25h' "$T/raw.txt"
-    check "screen cleared on redraw" grep -q $'\e\\[H\e\\[2J' "$T/raw.txt"
+    check "alternate screen entered" grep -q $'\e\\[?1049h' "$T/raw.txt"
+    check "cursor hidden in the menu" grep -q $'\e\\[?25l' "$T/raw.txt"
+    check "alternate screen left and cursor shown again" last_screen_restored
 }
 
-expect_nothing_changed() {  # menu left without running anything
+last_screen_restored() {  # the last alternate-screen / cursor sequences restore the terminal
+    [[ $(grep -ao $'\e\\[?1049[hl]' "$T/raw.txt" | tail -n1) == $'\e[?1049l' ]] &&
+        [[ $(grep -ao $'\e\\[?25[lh]' "$T/raw.txt" | tail -n1) == $'\e[?25h' ]]
+}
+
+expect_nothing_changed() {  # left without running anything
     expect_no_pkg_change
     expect_no_call '^systemctl (mask|enable|restart|stop|reboot)'
     expect_no_file "$(state_file)"
-    expect_no_file "$R/run/fedora-kde-setup.lock"
     expect_home_intact "$H"
 }
 
-last_cursor_shown() {  # the last cursor show/hide sequence in the raw output is "show"
-    [[ $(grep -ao $'\e\[?25[lh]' "$T/raw.txt" | tail -n1) == $'\e[?25h' ]]
+menu_row_selected() { expect_out "\\[x\\] +$1"; }
+
+menu_frames() {  # the text drawn inside the alternate screen, without escape sequences
+    local raw
+    raw=$(<"$T/raw.txt")
+    raw=${raw#*$'\e[?1049h'}
+    raw=${raw%$'\e[?1049l'*}
+    sed -e 's/\x1b\][^\x07]*\x07//g' -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\r$//' <<<"$raw"
 }
 
-menu_row_selected() {  # TITLE_RE: some redraw shows the row ticked
-    expect_out "\\[x\\] +$1 +\\[(Recommended|Optional)\\]"
+menu_frames_fit_rows() {  # ROWS: every redraw (after a clear-screen) has fewer lines
+    local rows=$1 raw frame n
+    raw=$(<"$T/raw.txt")
+    raw=${raw#*$'\e[?1049h'}
+    raw=${raw%$'\e[?1049l'*}
+    while [[ $raw == *$'\e[H\e[2J'* ]]; do
+        raw=${raw#*$'\e[H\e[2J'}
+        frame=${raw%%$'\e[H\e[2J'*}
+        n=$(printf '%s' "$frame" | grep -c '')
+        (( n <= rows - 1 )) || return 1
+    done
 }
 
-scenario menu_pick "pty" "Menu: Space on DNF, Up×3 to maintenance (wrapping), Space, Down to Continue, Enter, y"
+menu_frames_fit() {  # WIDTH: no menu line is wider (in characters)
+    local LC_ALL=C.UTF-8 line
+    while IFS= read -r line; do
+        (( ${#line} <= $1 )) || return 1
+    done < <(menu_frames)
+}
+
+scenario menu_pick "pty" "Menu: select DNF and maintenance with arrows/Space, Continue, review, y"
 sc_menu_pick() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT=$(keys "$SPACE" "$UP" "$UP" "$UP" "$SPACE" "$DOWN" "$ENTER" 'y\n')
+    PTY_INPUT=$(keys "$SPACE" "$(rep_key "$DOWN" 5)" "$SPACE" "$(rep_key "$DOWN" 3)" "$ENTER")$START_YES
     invoke --no-reboot
     expect_success
     expect_menu_shown
     menu_row_selected 'Faster DNF downloads'
     menu_row_selected 'SSD trim \+ smaller system logs'
     expect_out 'Continue with 2 selected steps'
+    expect_out '^  Ready to start 2 steps \(usually about 1-2 minutes in total\):$'
     expect_will_do '1. Faster DNF downloads'
     expect_will_do '2. SSD trim + smaller system logs'
     expect_no_will_do 'Full system update'
-    expect_out 'Proceed\? \[y/N\]'
+    expect_out_fixed '  Keep the laptop plugged in until it finishes.'
+    expect_no_out 'A reboot will probably be needed'
     expect_no_call '^dnf5 upgrade'
     expect_no_call '^df '
     expect_no_call '^curl'
@@ -2130,33 +2185,37 @@ sc_menu_pick() {
     expect_no_out 'Reboot now'
 }
 
-scenario menu_recommended "pty" "Menu: r selects the recommended steps not done yet; n at Proceed aborts"
+scenario menu_recommended "pty" "Menu: r selects the recommended steps not done yet; n at the review: nothing changed"
 sc_menu_recommended() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT=$(keys r "$UP" "$UP" "$ENTER" 'n\n')
+    PTY_INPUT=$(keys r "$UP" "$UP" "$ENTER")$START_NO
     invoke --no-reboot
-    expect_rc 1
+    expect_rc 0
     local t
     for t in "Faster DNF downloads" "Full system update" "Media codecs and video acceleration" \
         "Flathub as Discover's app store" "Firmware updates"; do expect_will_do "$t"; done
-    for t in "Remove KDE PIM" "Remove LibreOffice" "SSD trim" "Drivers"; do expect_no_will_do "$t"; done
+    for t in "Remove" "SSD trim" "Drivers"; do expect_no_will_do "$t"; done
     expect_out 'Continue with 5 selected steps'
-    expect_out 'Aborted, nothing was changed'
+    expect_out '^  Ready to start 5 steps \(usually about [0-9]+-[0-9]+ minutes in total\):$'
+    expect_out_fixed '  A reboot will probably be needed at the end.'
+    expect_out '^Nothing was changed\.$'
     expect_nothing_changed
 }
 
-scenario menu_everything "pty" "Menu: a selects everything not done yet (incl. optional)"
+scenario menu_everything "pty" "Menu: a selects everything not done yet except the app removals"
 sc_menu_everything() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT=$(keys a "$UP" "$UP" "$ENTER" 'n\n')
+    PTY_INPUT=$(keys a "$UP" "$UP" "$ENTER")$START_NO
     invoke --no-reboot
     local t
-    for t in "Faster DNF downloads" "Full system update" "Media codecs" "Remove KDE PIM" \
-        "Remove LibreOffice" "Flathub" "Firmware updates" "SSD trim"; do expect_will_do "$t"; done
-    expect_no_will_do 'Drivers'
-    expect_out 'Continue with 8 selected steps'
+    for t in "Faster DNF downloads" "Full system update" "Media codecs" "Flathub" "Firmware updates" "SSD trim"; do
+        expect_will_do "$t"
+    done
+    expect_no_will_do 'Remove'
+    expect_out 'Continue with 6 selected steps'
+    expect_out '^  REMOVE APPS YOU DON.T USE  \(deletes their data\)$'
     expect_nothing_changed
 }
 
@@ -2170,21 +2229,23 @@ sc_menu_none_continue() {
     expect_out 'Continue with 0 selected steps'
     expect_out_fixed 'Select at least one step first: move to it and press Enter or Space.'
     expect_out '^Nothing was changed\.$'
-    expect_no_out 'Will do:'
+    expect_no_out 'Ready to start'
     expect_nothing_changed
 }
 
-scenario menu_quit_keys "pty" "Menu: q, Esc, the Quit row, and closed input all quit with exit 0, nothing changed"
+scenario menu_quit_keys "pty" "Menu: q, Q, Esc, the Quit row and closed input all quit with exit 0"
 sc_menu_quit_keys() {
     AUTO_ALL=0
     menu_machine
     local input
-    for input in q Q '\e' "$UP$ENTER" "$UP$SPACE" ''; do
+    # (Closed input can't be shown through script(1); menu_ctrl_d types Ctrl-D instead.)
+    for input in q Q '\e' "$UP$ENTER" "$UP$SPACE"; do
         PTY_INPUT=$input
         invoke --no-reboot
         expect_rc 0
         expect_out '^Nothing was changed\.$'
-        expect_no_out 'Will do:'
+        expect_no_out 'Ready to start'
+        check "terminal restored (input '$input')" last_screen_restored
         expect_nothing_changed
     done
 }
@@ -2200,15 +2261,16 @@ sc_menu_ctrl_d() {
     expect_nothing_changed
 }
 
-scenario menu_ctrl_c "pty" "Menu: Ctrl-C while the menu waits: Interrupted, cursor restored, nothing changed"
+scenario menu_ctrl_c "pty" "Menu: Ctrl-C while the menu waits: 'Stopped. Nothing was changed.', exit 130, terminal restored"
 sc_menu_ctrl_c() {
     AUTO_ALL=0
     menu_machine
     PTY_INPUT="$SPACE|PAUSE|\\x03"
     invoke --no-reboot
-    expect_rc nonzero
-    expect_out 'Interrupted'
-    check "cursor shown again after Ctrl-C" last_cursor_shown
+    expect_rc 130
+    expect_out '^Stopped\. Nothing was changed\.$'
+    expect_no_out 'The script stopped'
+    check "alternate screen left and cursor shown after Ctrl-C" last_screen_restored
     expect_nothing_changed
 }
 
@@ -2216,13 +2278,12 @@ scenario menu_vi_keys "pty" "Menu: j/k/Tab move; k from the top wraps to Quit"
 sc_menu_vi_keys() {
     AUTO_ALL=0
     menu_machine
-    # j j -> codecs, Space; Tab x6 -> Continue (row 8); Enter; n at Proceed.
-    PTY_INPUT=$(keys j j "$SPACE" "$(rep_key '\t' 6)" "$ENTER" 'n\n')
+    # j j -> codecs (row 2), Space; Tab x6 -> Continue (row 8); Enter; n at the review.
+    PTY_INPUT=$(keys j j "$SPACE" "$(rep_key '\t' 6)" "$ENTER")$START_NO
     invoke --no-reboot
     expect_will_do '1. Media codecs and video acceleration'
     expect_no_will_do 'Faster DNF'
     expect_nothing_changed
-    # k from row 0 wraps to "Quit without changes"; Enter there quits.
     PTY_INPUT=$(keys k "$ENTER")
     invoke --no-reboot
     expect_rc 0
@@ -2233,7 +2294,7 @@ scenario menu_ss3_arrows "pty" "Menu: application-mode arrows (ESC O B / ESC O A
 sc_menu_ss3_arrows() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT=$(keys '\eOB' "$SPACE" '\eOA' '\eOA' '\eOA' "$ENTER" 'n\n')
+    PTY_INPUT=$(keys '\eOB' "$SPACE" '\eOA' '\eOA' '\eOA' "$ENTER")$START_NO
     invoke --no-reboot
     expect_will_do '1. Full system update'
     expect_nothing_changed
@@ -2251,22 +2312,71 @@ sc_menu_toggle_off() {
     expect_nothing_changed
 }
 
-scenario menu_done_overview "pty" "Menu: done steps are listed read-only on top, not selectable; n/a steps shown separately"
-sc_menu_done_overview() {
+scenario menu_help "pty" "Menu: ? shows the help screen, any key goes back"
+sc_menu_help() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT=$(keys '?' x q)
+    invoke --no-reboot
+    expect_rc 0
+    expect_out '^  How to use this checklist$'
+    expect_out_fixed '  Press any key to go back.'
+    expect_out_fixed '↑↓ move · Enter select · r recommended · a all · n none · ? help · q quit'
+    expect_nothing_changed
+}
+
+scenario menu_overview "pty" "Menu: done and not-needed steps are one-line summaries on top, not rows"
+sc_menu_overview() {
     AUTO_ALL=0
     menu_machine
     printf '[main]\nfastestmirror=True\nmax_parallel_downloads=10\ndefaultyes=True\n' > "$R/etc/dnf/dnf.conf"
     PTY_INPUT='q'
     invoke --no-reboot
     expect_rc 0
-    expect_out '^      ✔ Faster DNF downloads \(already set\)$'
-    expect_out '^  – Not needed on this computer$'
-    expect_out_fixed '      Drivers for your hardware (nothing needed: your graphics and Wi-Fi use built-in drivers)'
+    expect_out '^  ✔ Already done: DNF$'
+    expect_out '^  – Not needed here: Drivers$'
     check "no selectable row for the done DNF step" not grep -Eq '\[[ x]\] +Faster DNF downloads' "$OUT"
-    expect_out '\[ \] +Full system update +\[Recommended\]  • 3 updates available'
+    expect_out '\[ \] +Full system update  • 3 updates available'
+    expect_out '^  OPTIONAL$'
 }
 
-scenario menu_all_done "pty" "Menu with nothing left to do: overview + 'Everything ... is already done', exit 0"
+scenario menu_sizes "pty" "Menu at 120x50 shows every explanation; at 60x14 it scrolls and shortens the key help"
+sc_menu_sizes() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_ROWS=50 PTY_COLS=120
+    PTY_INPUT='q'
+    invoke --no-reboot
+    expect_out 'Picks the fastest mirror and downloads 10 files at once'
+    expect_out 'Removes the office suite if you use something else'
+    expect_no_out 'more line'
+    PTY_ROWS=18 PTY_COLS=60
+    PTY_INPUT='q'
+    invoke --no-reboot
+    expect_rc 0
+    check "every menu frame fits in 18 rows" menu_frames_fit_rows 18
+    expect_out '↓ [0-9]+ more line\(s\)'
+    expect_out_fixed '↑↓ move · Enter select · ? help · q quit'
+    expect_no_out 'r recommended'
+    check "menu frames fit the 60-column terminal" menu_frames_fit 60
+    # Scrolled down to the last row: the top part is hidden behind "↑ N more".
+    PTY_INPUT=$(keys "$(rep_key "$DOWN" 7)" q)
+    invoke --no-reboot
+    expect_out '↑ [0-9]+ more line\(s\)'
+}
+
+scenario menu_tiny_terminal "pty" "Menu in a 14-row terminal (smallest the script accepts is 10): every frame must fit"
+sc_menu_tiny_terminal() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_ROWS=14 PTY_COLS=80
+    PTY_INPUT=$(keys "$(rep_key "$DOWN" 7)" q)
+    invoke --no-reboot
+    expect_rc 0
+    check "every menu frame fits in 14 rows (so the highlighted row stays visible)" menu_frames_fit_rows 14
+}
+
+scenario menu_all_done "pty" "Menu with nothing left: overview + 'Everything ... is already done', exit 0"
 sc_menu_all_done() {
     AUTO_ALL=0
     fx_fully_configured
@@ -2275,7 +2385,7 @@ sc_menu_all_done() {
     expect_rc 0
     expect_out_fixed 'Everything that applies to this computer is already done.'
     expect_out 'To redo a step anyway: sudo bash .* --only <step> --force'
-    expect_no_out 'Select what to do'
+    expect_no_out 'Continue with'
     expect_no_pkg_change
 }
 
@@ -2283,12 +2393,12 @@ scenario menu_auto_update "pty" "Menu: drivers auto-selects the update; unselect
 sc_menu_auto_update() {
     AUTO_ALL=0
     fx_gpu_nvidia "${NV_TU106[@]}"
-    # Rows: 0 dnf, 1 update, 2 codecs, 3 drivers, ..., 8 maintenance, 9 Continue, 10 Quit.
-    PTY_INPUT=$(keys "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$UP" "$UP" "$SPACE" "$UP" "$UP" "$UP" "$ENTER" 'n\n')
+    # Rows: 0 dnf, 1 update, 2 codecs, 3 drivers ... 9 Continue, 10 Quit.
+    PTY_INPUT=$(keys "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$UP" "$UP" "$SPACE" "$UP" "$UP" "$UP" "$ENTER")$START_NO
     invoke --no-reboot
-    expect_out 'Full system update .*\(needed by Drivers\)$'
-    expect_out_fixed 'This step is needed by the drivers step; unselect that one first.'
-    expect_will_do 'Full system update  (needed by Drivers)'
+    expect_out 'Full system update  • 3 updates available  \(needed by Drivers\)'
+    expect_out_fixed 'The system update is needed by the drivers step; unselect the drivers first.'
+    expect_out '^   1\. Full system update +needed by the drivers$'
     expect_will_do 'Drivers: NVIDIA GeForce RTX 2060 Rev. A'
     expect_nothing_changed
 }
@@ -2304,18 +2414,88 @@ sc_menu_untick_drivers() {
     expect_nothing_changed
 }
 
+scenario menu_sb_review "pty" "Menu with NVIDIA + Secure Boot: the review says the password comes next; asked before step 1"
+sc_menu_sb_review() {
+    AUTO_ALL=0
+    fx_gpu_nvidia "${NV_TU106[@]}"
+    fx_conf FKS_SB=enabled
+    PTY_INPUT=$(keys "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$(rep_key "$DOWN" 6)" "$ENTER")$START_YES
+    invoke --no-reboot
+    expect_success
+    expect_out "Drivers: NVIDIA GeForce RTX 2060 Rev\\. A +Secure Boot: you'll set a one-time password right after this screen"
+    expect_out_before '^== Secure Boot key \(before the long part\)$' 'Step 1 of 2'
+    expect_call_line "mokutil --import $(mok_cert)"
+    expect_order '^mokutil --import' '^dnf5 upgrade --refresh'
+}
+
+# --- Removals: only on explicit request, reviewed first ---------------------------
+
+scenario menu_remove_pim "pty" "Menu: select KDE PIM; review shows what's deleted; type 'delete' for real mail"
+sc_menu_remove_pim() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT=$(keys "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|delete\\n"
+    invoke --no-reboot
+    expect_success
+    expect_out '^  REMOVE APPS YOU DON.T USE  \(deletes their data\)$'
+    expect_will_do 'Remove KDE PIM (KMail, Kontact, KOrganizer...)'
+    expect_out "^      ! deletes: ${#FX_PIM_JUNK[@]} item\\(s\\), [0-9.]+[KMG]? in your home folder$"
+    expect_out_fixed "You have mail or contacts in $H/.local/share that will be deleted for good."
+    expect_action "^dnf5 remove -y $PIM_SORTED$"
+    expect_deleted "$H" "${FX_PIM_JUNK[@]}"
+    expect_kept "$H" "${FX_OFFICE_JUNK[@]}"
+    expect_recorded pim
+}
+
+scenario menu_remove_pim_keep "pty" "Menu: KDE PIM selected, Enter instead of 'delete': PIM kept, nothing else -> nothing changed"
+sc_menu_remove_pim_keep() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT=$(keys "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|\\n"
+    invoke --no-reboot
+    expect_rc 0
+    expect_out_fixed 'OK, KDE PIM and its data are kept.'
+    expect_out '^Nothing was changed\.$'
+    expect_nothing_changed
+}
+
+scenario menu_remove_no_mail "pty" "Menu: KDE PIM without real mail/contacts: no 'delete' question"
+sc_menu_remove_no_mail() {
+    AUTO_ALL=0
+    menu_machine
+    rm -rf "$H/.local/share/local-mail" "$H/.local/share/contacts"
+    PTY_INPUT=$(keys "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")$START_YES
+    invoke --no-reboot
+    expect_success
+    expect_no_out 'to confirm'
+    expect_recorded pim
+}
+
+scenario menu_remove_apps "pty" "Menu: PIM removal also takes kgpg: review lists it, confirming removes it too"
+sc_menu_remove_apps() {
+    AUTO_ALL=0
+    menu_machine
+    fx_add remove_extra 'kmail kgpg'
+    PTY_INPUT=$(keys "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|delete\\n"
+    invoke --no-reboot
+    expect_success
+    expect_out_fixed '      ! also removes these apps, which use its libraries: kgpg'
+    expect_action "^dnf5 remove -y $PIM_SORTED$"
+    expect_no_out "wasn't on the review screen"
+    expect_recorded pim
+}
+
 scenario menu_leftover "pty" "Menu: leftover PIM data is never selected by a/r; selecting it explicitly cleans it"
 sc_menu_leftover() {
     AUTO_ALL=0
     menu_machine
     fx_del installed "${FX_PIM[@]}"
-    PTY_INPUT=$(keys a "$UP" "$UP" "$ENTER" 'n\n')
+    PTY_INPUT=$(keys a "$UP" "$UP" "$ENTER")$START_NO
     invoke --no-reboot
-    expect_out '\[ \] +Remove leftover KDE PIM data +\[Optional\]  ◐ partly done: app removed, data still in your home folder'
+    expect_out '\[ \] +Remove leftover KDE PIM data  ◐ partly done: app removed'
     expect_no_will_do 'Remove leftover KDE PIM data'
     expect_nothing_changed
-    # Rows: 0 dnf, 1 update, 2 codecs, 3 pim (leftover), ... 7 maintenance, 8 Continue.
-    PTY_INPUT=$(keys "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$(rep_key "$DOWN" 5)" "$ENTER" 'y\n')
+    PTY_INPUT=$(keys "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|delete\\n"
     invoke --no-reboot
     expect_success
     expect_will_do '1. Remove leftover KDE PIM data'
@@ -2328,23 +2508,36 @@ scenario menu_full_run "pty" "Menu: r + maintenance, run everything selected, de
 sc_menu_full_run() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT=$(keys r "$UP" "$UP" "$UP" "$SPACE" "$DOWN" "$ENTER" 'y\n' 'n\n')
+    PTY_INPUT=$(keys r "$(rep_key "$DOWN" 5)" "$SPACE" "$(rep_key "$DOWN" 3)" "$ENTER")"$START_YES|WAIT:Reboot now|n\\n"
     invoke
     expect_success
     expect_menu_shown
+    expect_out 'All 6 steps finished\.'
+    expect_out_fixed 'Save your work in other apps first.'
     expect_out 'Reboot now\? \(recommended\) \[Y/n\]'
     expect_out_fixed 'OK. Remember to reboot soon.'
     expect_no_call '^systemctl reboot'
-    expect_out 'Finished: 6 of 6 steps done'
 }
 
 # --- Choosing steps with flags --------------------------------------------------
+
+scenario all_never_removes "dry live" "--all (and --all --force) never select the app removals"
+sc_all_never_removes() {
+    invoke --all --yes --no-reboot
+    expect_success
+    expect_no_will_do 'Remove'
+    expect_no_action '^dnf5 remove -y'
+    expect_home_intact "$H"
+    invoke --all --force --yes --no-reboot
+    expect_no_will_do 'Remove'
+}
 
 scenario only_libreoffice "live" "--only libreoffice: LibreOffice removed; PIM, update, RPM Fusion, network untouched"
 sc_only_libreoffice() {
     invoke --only libreoffice --yes --no-reboot
     expect_success
     expect_will_do '1. Remove LibreOffice'
+    expect_out "^      ! deletes: ${#FX_OFFICE_JUNK[@]} item\\(s\\), .* in your home folder$"
     expect_action "^dnf5 remove -y $OFFICE_SORTED$"
     expect_no_action "^dnf5 remove -y $PIM_SORTED$"
     expect_no_call '^dnf5 upgrade|^curl|^rpmkeys'
@@ -2365,11 +2558,12 @@ sc_only_codecs() {
     expect_recorded codecs
 }
 
-scenario only_pim "live" "--only pim: no network check at all"
+scenario only_pim "live" "--only pim with --yes: removed (no 'delete' question), no network check"
 sc_only_pim() {
     invoke --only pim --yes --no-reboot
     expect_success
     expect_no_call '^curl'
+    expect_no_out 'to confirm'
     expect_action "^dnf5 remove -y $PIM_SORTED$"
     expect_no_action "^dnf5 remove -y $OFFICE_SORTED$"
     expect_recorded pim
@@ -2383,17 +2577,18 @@ sc_only_dnf() {
     expect_file "$R/run/fedora-kde-setup.lock"
     expect_recorded dnf
     expect_out_fixed 'No reboot needed.'
+    expect_out '^All 1 step finished\.|== All 1 step finished\. =='
 }
 
-scenario skip_steps "live" "--all --skip pim,libreoffice: both left alone"
+scenario skip_steps "live" "--all --skip codecs,flathub: both left out"
 sc_skip_steps() {
-    invoke --all --skip pim,libreoffice --yes --no-reboot
+    invoke --all --skip codecs,flathub --yes --no-reboot
     expect_success
-    expect_no_will_do 'Remove'
-    expect_no_action '^dnf5 remove -y'
-    expect_home_intact "$H"
+    expect_no_will_do 'Media codecs'
+    expect_no_will_do 'Flathub'
+    expect_no_call '^rpmkeys|^flatpak remote'
     expect_recorded maintenance
-    expect_not_recorded pim
+    expect_not_recorded codecs
 }
 
 scenario skip_update_drivers "live" "--all --skip update with NVIDIA: drivers dropped (they need the update)"
@@ -2408,12 +2603,12 @@ sc_skip_update_drivers() {
     expect_no_action 'akmod-nvidia'
 }
 
-scenario only_drivers_dep "dry" "--only drivers with pending updates: update added '(needed by Drivers)'"
+scenario only_drivers_dep "dry" "--only drivers with pending updates: update added, 'needed by the drivers'"
 sc_only_drivers_dep() {
     fx_gpu_nvidia "${NV_TU106[@]}"
     invoke --only drivers --yes
     expect_success
-    expect_will_do '1. Full system update  (needed by Drivers)'
+    expect_out '^   1\. Full system update +needed by the drivers$'
     expect_will_do '2. Drivers: NVIDIA GeForce RTX 2060 Rev. A'
 }
 
@@ -2422,13 +2617,13 @@ sc_flag_errors() {
     EXPECT_NO_LOG=1
     invoke --only pim --skip dnf
     expect_rc 1
-    expect_out_fixed -- '--skip only works together with --all'
+    expect_out_fixed -- 'Error: --skip only works together with --all'
     invoke --only pim --all
     expect_rc 1
-    expect_out_fixed 'Use either --only or --all, not both'
+    expect_out_fixed 'Error: Use either --only or --all, not both'
     invoke --only dnf,foo
     expect_rc 1
-    expect_out_fixed "Unknown step 'foo' in --only. Valid steps: dnf update codecs drivers pim libreoffice flathub firmware maintenance"
+    expect_out_fixed "Error: Unknown step 'foo' in --only. Valid steps: dnf update codecs drivers pim libreoffice flathub firmware maintenance"
     invoke --all --skip bar
     expect_rc 1
     expect_out_fixed "Unknown step 'bar' in --skip."
@@ -2443,7 +2638,7 @@ sc_yes_without_selection() {
     AUTO_ALL=0
     invoke --yes --no-reboot
     expect_untouched
-    expect_out_fixed 'Choose steps with --only ... or --all (see --list-steps). Nothing was changed.'
+    expect_out_fixed 'Error: Choose steps with --only ... or --all (see --list-steps). Nothing was changed.'
 }
 
 scenario notty_no_flags "dry live" "No terminal, no flags: real run refuses; dry run previews all not-done steps"
@@ -2455,22 +2650,26 @@ sc_notty_no_flags() {
         expect_out_fixed 'No terminal to show the checklist on. Choose steps with --only ... or --all, plus --yes.'
     else
         expect_success
-        expect_out_fixed "No terminal for the checklist: previewing every step that isn't done yet"
+        expect_out_fixed "No terminal for the checklist: previewing every step that isn't done yet (except app removals)"
         expect_will_do 'Full system update'
         expect_will_do 'SSD trim'
+        expect_no_will_do 'Remove'
     fi
 }
 
-scenario list_steps "dry" "--list-steps prints IDs, titles, tags and reasons; runs nothing"
+scenario list_steps "dry" "--list-steps prints the grouped step list; runs nothing"
 sc_list_steps() {
     EXPECT_NO_LOG=1
     invoke --list-steps
     expect_rc 0
-    expect_out '^Steps \(use the IDs with --only, --skip\):$'
-    expect_out "^  dnf +Faster DNF downloads \\[Recommended\\]$"
-    expect_out "^  pim +Remove KDE PIM \\(KMail, Kontact, KOrganizer\\.\\.\\.\\) \\[Optional\\]$"
-    expect_out "^  maintenance +SSD trim \\+ smaller system logs \\[Optional\\]$"
-    expect_out 'Picks the fastest mirror and downloads 10 files at once'
+    expect_out '^Steps \(use the IDs with --only and --skip\):$'
+    expect_out '^  RECOMMENDED$'
+    expect_out '^  OPTIONAL$'
+    expect_out "^  REMOVE APPS YOU DON'T USE  \\(deletes their data\\)$"
+    expect_out '^    dnf +Faster DNF downloads$'
+    expect_out '^    pim +Remove KDE PIM \(KMail, Kontact, KOrganizer\.\.\.\)$'
+    expect_out '^    maintenance +SSD trim \+ smaller system logs$'
+    expect_out_fixed "--all selects every step that applies and isn't done yet, except the app removals."
     check "no command called" not test -s "$CALLS"
 }
 
@@ -2487,7 +2686,7 @@ sc_nothing_to_do() {
     check "dnf.conf unchanged" cmp -s "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
 }
 
-scenario force_rerun "live" "Fully set-up VM + --all --force: every applicable step reruns, no needless reboot"
+scenario force_rerun "live" "Fully set-up VM + --all --force: every applicable non-removal step reruns, no needless reboot"
 sc_force_rerun() {
     fx_fully_configured
     cp "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
@@ -2495,15 +2694,15 @@ sc_force_rerun() {
     expect_success
     local t
     for t in "Faster DNF downloads" "Full system update" "Media codecs" "Guest tools for this virtual machine (kvm)" \
-        "Remove KDE PIM" "Remove LibreOffice" "Flathub" "SSD trim"; do expect_will_do "$t"; done
+        "Flathub" "SSD trim"; do expect_will_do "$t"; done
     expect_no_will_do 'Firmware'
+    expect_no_will_do 'Remove'
     check "dnf.conf byte-identical (values already set)" cmp -s "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
     expect_out 'fastestmirror is already set'
     expect_out 'RPM Fusion already installed'
-    expect_out 'KDE PIM is not installed'
     # Nothing was pending, so the upgrade changed nothing: no reboot advice from it.
     expect_out_fixed 'No reboot needed.'
-    expect_out 'Finished: 8 of 8 steps done'
+    expect_out 'All 6 steps finished\.'
 }
 
 scenario only_done_skipped "live" "--only with an already-done step: listed under Skipped"
@@ -2525,6 +2724,17 @@ sc_only_not_applicable() {
     expect_out_fixed 'Skipping Firmware updates: not available in a virtual machine'
     expect_no_out 'already done'
     expect_no_pkg_change
+}
+
+scenario two_steps_fail "live" "Two steps not completed: summary says '2 need attention', exit 0"
+sc_two_steps_fail() {
+    fx_add unavailable gstreamer1-plugins-bad-freeworld
+    fx_conf FKS_FWUPD_RC=1
+    invoke --only dnf,codecs,firmware --yes --no-reboot
+    expect_rc 0
+    expect_out_fixed '1 of 3 steps finished; 2 need attention (see below).'
+    expect_out 'Not completed \(see warnings\):'
+    expect_recorded dnf
 }
 
 scenario akmods_already_built "live" "Modules already built for the newest kernel: no akmods/kernel-devel, reboot still advised"
@@ -2569,11 +2779,22 @@ sc_dnfconf_keep_higher() {
     expect_no_out 'set max_parallel_downloads'
 }
 
+scenario dnfconf_already_set "live" "dnf.conf already set: --only dnf --force leaves the file byte-identical"
+sc_dnfconf_already_set() {
+    printf '[main]\ngpgcheck=True\nfastestmirror=True\nmax_parallel_downloads=10\ndefaultyes=True\n' > "$R/etc/dnf/dnf.conf"
+    cp "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
+    invoke --only dnf --force --yes --no-reboot
+    expect_success
+    check "dnf.conf byte-identical" cmp -s "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
+    expect_no_out '\$ set '
+}
+
 # --- Status detection ------------------------------------------------------------
-# --status prints the overview ("✔ Already done", "– Not needed") and a "Still to do" list.
+# --status prints the overview ("✔ Already done", "– Not needed") and a grouped
+# "Still to do" list.
 
 expect_status_done() { expect_out "^      ✔ $1 \\($2\\)\$"; }
-expect_status_todo() { expect_out "^      \\[ \\] $1  \\[(Recommended|Optional)\\]  ${2:-}\$"; }
+expect_status_todo() { expect_out "^      \\[ \\] $1  ${2:-}\$"; }
 expect_status_na()   { expect_out_fixed "      $1 ($2)"; }
 
 status_unchanged_checks() {
@@ -2583,8 +2804,8 @@ status_unchanged_checks() {
     expect_no_pkg_change
     expect_no_call '^systemctl (mask|enable|restart|stop)|^curl|^df '
     expect_no_file "$R/run/fedora-kde-setup.lock"
-    expect_no_out 'Will do:|Continue with|Quit without changes'
-    check "no cursor/screen control in --status" not grep -q $'\e\\[?25l' "$T/raw.txt"
+    expect_no_out 'Ready to start|Continue with|Quit without changes'
+    check "no menu screen in --status" not grep -q $'\e\\[?1049h' "$T/raw.txt"
 }
 
 scenario status_fresh "live user" "--status on a fresh laptop: todo/partial/n-a; no changes; works without root"
@@ -2597,7 +2818,10 @@ sc_status_fresh() {
     check "fake root and homes unchanged by --status" test "$before" == "$(tree_state "$R" "$T/home")"
     expect_out '^  ✔ Already done on this computer$'
     expect_out '^      nothing yet$'
+    expect_out '^  – Not needed on this computer$'
     expect_status_na 'Drivers for your hardware' 'nothing needed: your graphics and Wi-Fi use built-in drivers'
+    expect_out '^    RECOMMENDED$'
+    expect_out "^    REMOVE APPS YOU DON'T USE  \\(deletes their data\\)\$"
     expect_status_todo 'Faster DNF downloads'
     expect_status_todo 'Full system update' '• 3 updates available'
     expect_status_todo 'Media codecs and video acceleration'
@@ -2607,6 +2831,8 @@ sc_status_fresh() {
         "◐ partly done: missing Flathub, Fedora's duplicate Flatpak source disabled, Flathub as Discover's default"
     expect_status_todo 'Firmware updates' '• not checked yet'
     expect_status_todo 'SSD trim \+ smaller system logs'
+    expect_out_before '^    RECOMMENDED$' '^    OPTIONAL$'
+    expect_out_before '^    OPTIONAL$' '^    REMOVE APPS'
     if [[ $MODE == user ]]; then
         expect_no_out 'Run this with sudo'
         expect_call '^dnf5 -q check-upgrade$'
@@ -2706,10 +2932,10 @@ sc_status_container() {
     expect_status_done 'SSD trim \+ smaller system logs' 'already set up'
 }
 
-scenario status_after_run "live" "After --all, --status lists the steps as done"
+scenario status_after_run "live" "After a run, --status lists those steps as done"
 sc_status_after_run() {
     menu_machine
-    invoke --all --yes --no-reboot
+    invoke --only "$ALL_AND_REMOVALS" --yes --no-reboot
     expect_success
     invoke --status
     expect_status_done 'Faster DNF downloads' 'already set'
@@ -2724,52 +2950,58 @@ sc_status_after_run() {
 
 # --- Progress and reboot advice ----------------------------------------------------
 
-progress_percents() {  # prints the percentages of the progress lines, in order
-    grep -oE "$1" "$OUT" | grep -oE '[0-9]+%' | tr -d %
+progress_percents() {  # ERE -> the percentages of the matching lines, in order
+    grep -E "$1" "$OUT" | grep -oE '[0-9]+%' | tr -d %
 }
-monotonic_to_100() {  # reads numbers: non-decreasing, starts at 0, ends at 100
+monotonic_from_0() {  # reads numbers: non-decreasing and starting at 0; $1 = required last value
     local prev=-1 n first="" last=""
     while read -r n; do
         [[ -z $first ]] && first=$n
         (( n >= prev )) || return 1
         prev=$n last=$n
     done
-    [[ $first == 0 && $last == 100 ]]
+    [[ $first == 0 && ( -z ${1:-} || $last == "$1" ) ]]
 }
 
-scenario progress_plain "live" "No terminal: plain '[N%] Step i of n' lines, rising to 100%"
+scenario progress_plain "live" "No terminal: '== Step i of n · Title · time (N%) ==' headers, rising; done lines; verdict"
 sc_progress_plain() {
     menu_machine
     invoke --all --yes --no-reboot
     expect_success
     local i
-    for i in 1 2 3 4 5 6 7 8; do expect_out "^\\[[0-9]+%\\] Step $i of 8: "; done
-    expect_out '^\[0%\] Step 1 of 8: Faster DNF downloads$'
-    expect_out '^\[100%\] Finished: 8 of 8 steps done$'
-    check "percentages rise monotonically from 0 to 100" monotonic_to_100 < <(progress_percents '^\[[0-9]+%\]')
+    for i in 1 2 3 4 5 6; do
+        expect_out "^== Step $i of 6 · .* \\([0-9]+%\\) ==\$"
+        expect_out "^  ✔ Step $i of 6 done \\([0-9]+ s\\)\$"
+    done
+    expect_out '^== Step 1 of 6 · Faster DNF downloads · under a minute \(0%\) ==$'
+    expect_out '^== Step 2 of 6 · Full system update · usually 5-30 min \([0-9]+%\) ==$'
+    expect_out '^== All 6 steps finished\. ==$'
+    check "percentages rise from 0" monotonic_from_0 < <(progress_percents '^== Step [0-9]+ of')
     check "no bar characters without a terminal" not grep -q '█' "$OUT"
 }
 
-scenario progress_tty "pty" "Terminal: bar lines with percentages, window title updates, ends at 100%"
+scenario progress_tty "pty" "Terminal: '━━ Step ━━' headers with bars, window title, final 100% bar"
 sc_progress_tty() {
     menu_machine
     invoke --all --yes --no-reboot
     expect_success
-    expect_out '^\[░{24}\]   0%  Step 1 of 8: Faster DNF downloads$'
-    expect_out '^\[█{24}\] 100%  Finished: 8 of 8 steps done$'
-    check "percentages rise monotonically from 0 to 100" \
-        monotonic_to_100 < <(progress_percents '^\[[█░]{24}\] +[0-9]+%')
-    check "window title set via OSC" grep -q $'\e\\]0;fedora-kde-setup [0-9]*%\a' "$T/raw.txt"
+    expect_out '^━━ Step 1 of 6 · Faster DNF downloads · under a minute ━━$'
+    expect_out '^\[░{24}\]   0%$'
+    expect_out '^━━ All 6 steps finished\. ━━$'
+    expect_out '^\[█{24}\] 100%$'
+    check "bar percentages rise from 0 to 100" monotonic_from_0 100 < <(progress_percents '^\[[█░]{24}\] +[0-9]+%$')
+    check "window title shows the step" grep -q $'\e\\]0;fedora-kde-setup · Step 1/6 · 0%\a' "$T/raw.txt"
     check "window title says done at the end" grep -q $'\e\\]0;fedora-kde-setup: done\a' "$T/raw.txt"
 }
 
 scenario reboot_declined "pty" "Reboot advised after the update: prompt shown, 'n' declines"
 sc_reboot_declined() {
     menu_machine
-    PTY_INPUT='y\nn\n'
+    PTY_INPUT="$START_YES|WAIT:Reboot now|n\\n"
     invoke
     expect_success
     expect_out_fixed 'A reboot is recommended so updated system services and libraries are used.'
+    expect_out_fixed 'Save your work in other apps first.'
     expect_out 'Reboot now\? \(recommended\) \[Y/n\]'
     expect_out_fixed 'OK. Remember to reboot soon.'
     expect_no_call '^systemctl reboot'
@@ -2778,7 +3010,7 @@ sc_reboot_declined() {
 scenario reboot_eof "pty" "Reboot prompt answered with Ctrl-D (EOF): treated as no, no reboot"
 sc_reboot_eof() {
     menu_machine
-    PTY_INPUT='y\n'
+    PTY_INPUT="$START_YES|WAIT:Reboot now|\\x04"
     invoke
     expect_success
     expect_out 'Reboot now\? \(recommended\) \[Y/n\]'
@@ -2788,11 +3020,23 @@ sc_reboot_eof() {
 scenario reboot_not_needed "pty" "Only DNF + maintenance: 'No reboot needed', no prompt"
 sc_reboot_not_needed() {
     menu_machine
-    PTY_INPUT='y\n'
+    PTY_INPUT=$START_YES
     invoke --only dnf,maintenance
     expect_success
     expect_out_fixed 'No reboot needed.'
     expect_no_out 'Reboot now'
+}
+
+scenario typeahead_flushed "pty" "Keys typed during the run are thrown away before the reboot question"
+sc_typeahead_flushed() {
+    menu_machine
+    EXPECT_REBOOT=0
+    # A stray "y" typed while the steps run must not answer "Reboot now?".
+    PTY_INPUT="$START_YES|WAIT:Step 2 of|y\\n|WAIT:Reboot now|n\\n"
+    invoke
+    expect_success
+    expect_no_call '^systemctl reboot'
+    expect_out_fixed 'OK. Remember to reboot soon.'
 }
 
 scenario folder_hint "live" "Script run from a folder named fedora-kde-postinstall: suggests deleting it; other names: no hint"

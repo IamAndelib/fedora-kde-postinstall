@@ -15,7 +15,11 @@ SETSID_BIN=$(command -v setsid || true)
 SCRIPT_BIN=$(command -v script || true)
 UNSHARE_BIN=$(command -v unshare || true)
 SETPRIV_BIN=$(command -v setpriv || true)
-readonly BASH_BIN ENV_BIN SETSID_BIN SCRIPT_BIN UNSHARE_BIN SETPRIV_BIN
+STTY_BIN=$(command -v stty || true)
+TIMEOUT_BIN=$(command -v timeout || true)
+readonly BASH_BIN ENV_BIN SETSID_BIN SCRIPT_BIN UNSHARE_BIN SETPRIV_BIN STTY_BIN TIMEOUT_BIN
+# A run that waits for input nobody sends must not hang the suite.
+readonly RUN_TIMEOUT=${FKS_RUN_TIMEOUT:-180}
 readonly MOK_CERT_PATH=/etc/pki/akmods/certs/public_key.der
 
 ROOTCMD=()          # prefix that gives root: () when already root, (sudo -n) otherwise
@@ -109,6 +113,7 @@ new_scenario_dirs() {  # $1 = scenario name
     KEEP_ROOT_OWNER=0
     AUTO_ALL=1
     SCRIPT_UNDER_TEST=""
+    PTY_ROWS=24 PTY_COLS=80
     LOCK_FD=""
     RC=""
     IS_DRY=0
@@ -166,7 +171,9 @@ invoke() {
         "TMPDIR=$T/tmp" "HOME=$T/invoker-home" LANG=C "${RUN_ENV[@]}"
     )
     local cmd=("$ENV_BIN" -i "${envv[@]}" "$BASH_BIN" "${SCRIPT_UNDER_TEST:-$SCRIPT}" "${args[@]}")
-    local isolate=("${ROOTCMD[@]}" "$UNSHARE_BIN" --mount --propagation private -- \
+    local guard=()
+    [[ -n $TIMEOUT_BIN ]] && guard=("$TIMEOUT_BIN" -k 10 "$RUN_TIMEOUT")
+    local isolate=("${guard[@]}" "${ROOTCMD[@]}" "$UNSHARE_BIN" --mount --propagation private -- \
         "$BASH_BIN" "$FKS_LIB/isolate.sh" "$T/hostlog")
 
     local before=""
@@ -184,7 +191,7 @@ invoke() {
             if (( EUID == 0 )); then
                 ( cd "$T/cwd" && "${isolate[@]}" "$SETSID_BIN" -w "${cmd[@]}" ) </dev/null 2>&1 | cat > "$T/raw.txt"
             else
-                ( cd "$T/cwd" && "$SETSID_BIN" -w "${cmd[@]}" ) </dev/null 2>&1 | cat > "$T/raw.txt"
+                ( cd "$T/cwd" && "${guard[@]}" "$SETSID_BIN" -w "${cmd[@]}" ) </dev/null 2>&1 | cat > "$T/raw.txt"
             fi
             RC=${PIPESTATUS[0]}
             ;;
@@ -194,7 +201,8 @@ invoke() {
             ;;
         pty)
             local cmdline
-            cmdline=$(printf '%q ' "${cmd[@]}")
+            # A fixed terminal size, as stty reports it to the script's menu.
+            cmdline="$(printf '%q ' "$STTY_BIN" rows "$PTY_ROWS" cols "$PTY_COLS"); $(printf '%q ' "${cmd[@]}")"
             feed_pty_input "$PTY_INPUT" \
                 | ( cd "$T/cwd" && "${isolate[@]}" "$SCRIPT_BIN" -qec "$cmdline" /dev/null ) 2>&1 \
                 | cat > "$T/raw.txt"
@@ -226,8 +234,9 @@ invoke() {
         expect_no_out 'command not found'
     fi
     if (( !EXPECT_ERRTRAP )); then
-        expect_no_out 'Failed at line'
+        expect_no_out 'this command failed \(exit code'
     fi
+    check "run finished before the ${RUN_TIMEOUT}s timeout" test "$RC" -ne 124
     if (( !EXPECT_REBOOT )); then
         expect_no_call '^systemctl (reboot|poweroff|halt|kexec)'
     fi
@@ -248,15 +257,27 @@ invoke() {
     fi
 }
 
-# Keys for the pty, printf %b style. "|PAUSE|" waits 2 s, so a key arrives while the
-# script is already waiting for it (needed for Ctrl-C / Ctrl-D in the menu).
+# Keys for the pty, printf %b style, with two kinds of markers:
+#   |WAIT:ERE|  wait until the script's output matches ERE (e.g. a prompt) before sending
+#               more; the script flushes typed-ahead input before each yes/no question
+#   |PAUSE|     wait 2 s, so a key arrives while the script is already waiting for it
 feed_pty_input() {
-    local rest=$1 part
-    while [[ $rest == *"|PAUSE|"* ]]; do
-        part=${rest%%"|PAUSE|"*}
-        rest=${rest#*"|PAUSE|"}
+    local rest=$1 part marker re i
+    while [[ $rest =~ \|(WAIT:[^|]*|PAUSE)\| ]]; do
+        marker=${BASH_REMATCH[1]}
+        part=${rest%%"|$marker|"*}
+        rest=${rest#*"|$marker|"}
         printf '%b' "$part"
-        sleep 2
+        if [[ $marker == PAUSE ]]; then
+            sleep 2
+        else
+            re=${marker#WAIT:}
+            for (( i = 0; i < 300; i++ )); do
+                grep -aEq -- "$re" "$T/raw.txt" 2>/dev/null && break
+                sleep 0.1
+            done
+            sleep 0.2
+        fi
     done
     printf '%b' "$rest"
 }

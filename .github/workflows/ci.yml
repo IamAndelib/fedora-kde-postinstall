@@ -20,7 +20,7 @@ jobs:
       - name: Published checksum matches the script
         run: sha256sum -c fedora-kde-setup.sh.sha256
       - name: shellcheck
-        run: shellcheck fedora-kde-setup.sh tests/*.sh tests/lib/*.sh tests/lib/stub
+        run: shellcheck fedora-kde-setup.sh install.sh tests/*.sh tests/lib/*.sh tests/lib/stub
       - name: Scenario matrix
         run: bash tests/run.sh
 
@@ -37,6 +37,11 @@ jobs:
       image: registry.fedoraproject.org/fedora:${{ matrix.release }}
     steps:
       - uses: actions/checkout@v6
+      - name: One-line installer downloads, verifies and starts this commit
+        run: |
+          FEDORA_KDE_SETUP_REF=${{ github.sha }} bash install.sh --version | tee /tmp/launcher.log
+          grep -q 'Download verified' /tmp/launcher.log
+          grep -q '^fedora-kde-setup ' /tmp/launcher.log
       - name: Run the script for real and check the result
         run: bash tests/fedora-integration.sh ./fedora-kde-setup.sh
       - name: Upload the script's log

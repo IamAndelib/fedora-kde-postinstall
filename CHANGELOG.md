@@ -2,6 +2,8 @@
 
 ## v1.2.0
 
+- **One command to install and run:** `bash <(curl -fsSL …/main/install.sh)`. The launcher downloads the pinned release into a temporary folder, verifies its checksum, asks for your password and opens the checklist. Nothing is left behind. The script also asks for `sudo` by itself when started without it.
+- **Smart defaults:** recommended steps that aren't done yet start selected, so a first run is: Continue, `y`, done.
 - **Choose what to do:**
   - A colored checklist with a one-line explanation and a ⭐ Recommended / Optional tag for every step.
   - Nothing is ticked by default; `r` ticks the recommended steps.

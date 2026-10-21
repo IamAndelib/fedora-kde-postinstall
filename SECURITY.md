@@ -8,16 +8,23 @@ Please **don't open a public issue** for security problems. Use GitHub's private
 
 ## Verifying the script before you run it
 
-Every tagged version has `fedora-kde-setup.sh` together with its SHA-256 checksum. CI checks that the checksum always matches the script:
+**The one-line installer** (`bash <(curl -fsSL …/main/install.sh)`) is a short, readable [launcher](install.sh). It:
+1. downloads a **pinned, tested release** of the script (never the moving `main` branch) over HTTPS;
+2. checks its SHA-256 checksum, and stops if it doesn't match;
+3. only then runs it with `sudo`, from a temporary folder that is removed afterwards.
+
+Nothing runs as root before the checksum check. `bash <(curl …)` is used instead of `curl … | sudo bash`: the launcher itself runs as your user, and your keyboard stays connected for the menu.
+
+**To check everything yourself first:**
 
 ```bash
 mkdir -p ~/fedora-kde-postinstall && cd ~/fedora-kde-postinstall
-curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.1.0/fedora-kde-setup.sh
-curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.1.0/fedora-kde-setup.sh.sha256
+curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.2.0/fedora-kde-setup.sh
+curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.2.0/fedora-kde-setup.sh.sha256
 sha256sum -c fedora-kde-setup.sh.sha256
 ```
 
-Read it before running it as root, and run `--dry-run` first. Avoid `curl … | sudo bash`, which leaves you no chance to read or verify what you run.
+Read it, then run `sudo bash fedora-kde-setup.sh --dry-run` first. CI checks that the checksum file always matches the script.
 
 ## What runs as root, and how it's constrained
 
