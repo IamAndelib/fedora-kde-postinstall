@@ -47,7 +47,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/IamAndelib/fedora-kde-postin
 
 **That's the only command you need.** It:
 
-1. **Downloads the latest release** into a temporary folder and **verifies it**. Nothing is left in your home folder.
+1. **Downloads the current tested release** into a temporary folder and **verifies it**. Nothing is left in your home folder.
 2. **Asks for your password.** Nothing appears while you type it; that's normal.
 3. **Checks your computer:** Fedora version, hardware, and what's already set up.
 4. **Opens the checklist,** with the **recommended steps already selected:**

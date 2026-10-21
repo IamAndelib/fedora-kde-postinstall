@@ -29,7 +29,7 @@ for file in fedora-kde-setup.sh fedora-kde-setup.sh.sha256; do
         || fail "Couldn't download $BASE/$file. Check your internet connection and try again."
 done
 (cd "$dir" && sha256sum --quiet -c fedora-kde-setup.sh.sha256) \
-    || fail "The download is incomplete or was modified (checksum mismatch). Nothing was changed; please try again."
+    || fail "The download is incomplete or damaged (checksum mismatch). Nothing was changed; please try again."
 printf 'Download verified.\n'
 
 rc=0

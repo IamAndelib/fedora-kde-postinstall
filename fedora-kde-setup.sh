@@ -19,12 +19,28 @@ export LC_ALL=C.UTF-8
 if [[ -z ${FKS_ROOT:-} ]]; then
     export PATH=/usr/sbin:/usr/bin
 elif (( EUID == 0 )); then
-    # Test mode as root: only accept a fake root that nobody else could have prepared.
-    if [[ $(stat -c '%u' -- "$FKS_ROOT" 2>/dev/null) != 0 ]] \
-        || (( 8#$(stat -c '%a' -- "$FKS_ROOT" 2>/dev/null || echo 777) & 8#022 )); then
+    # Test mode as root: only accept a fake root that nobody else could have prepared or
+    # swapped, so the directory and every parent must be root-owned and not writable by
+    # others (sticky directories like /tmp are fine: others can't rename what's in them).
+    fks_dir=$(realpath -e -- "$FKS_ROOT" 2>/dev/null) || fks_dir=""
+    FKS_ROOT=$fks_dir
+    while [[ -n $fks_dir ]]; do
+        fks_mode=$(stat -c '%u %a' -- "$fks_dir" 2>/dev/null) || fks_mode="1 777"
+        if [[ ${fks_mode%% *} != 0 ]] \
+            || (( (8#${fks_mode#* } & 8#022) && !(8#${fks_mode#* } & 8#1000) )); then
+            fks_dir=""
+            FKS_ROOT=""
+            break
+        fi
+        [[ $fks_dir == / ]] && break
+        fks_dir=${fks_dir%/*}
+        fks_dir=${fks_dir:-/}
+    done
+    if [[ -z $FKS_ROOT ]]; then
         echo "FKS_ROOT is a test-only setting and must be a root-owned directory nobody else can write to." >&2
         exit 1
     fi
+    unset fks_dir fks_mode
     echo "TEST MODE: FKS_ROOT=$FKS_ROOT" >&2
 fi
 
@@ -124,10 +140,13 @@ section() { printf '\n%s== %s%s\n' "$C_BOLD$C_BLUE" "$*" "$C_RESET"; }
 info()    { printf '%s  ->%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
 hint()    { printf '%s  %s%s\n' "$C_YELLOW" "$*" "$C_RESET"; }
 ok()      { printf '%s  ✔%s %s\n' "$C_GREEN" "$C_RESET" "$*"; DONE+=("$*"); }
-warn()    { printf '%s  Warning:%s %s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$*" >&2; WARNINGS+=("$*"); }
+# Messages can include file names from the user's home: show control characters as "?" so
+# a crafted name can't send escape sequences to the terminal.
+printable() { local s=$*; printf '%s' "${s//[[:cntrl:]]/?}"; }
+warn()    { local m; m=$(printable "$*"); printf '%s  Warning:%s %s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$m" >&2; WARNINGS+=("$m"); }
 die()     { printf '%sError:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; exit 1; }
 # fd 3 is the terminal/log, so a command's own redirections never hide its log line.
-log_cmd() { printf '%s  $ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3; }
+log_cmd() { printf '%s  $ %s%s\n' "$C_DIM" "$(printable "$*")" "$C_RESET" >&3; }
 
 on_error() {
     local rc=$1 line=$2 cmd=$3
@@ -997,8 +1016,10 @@ status_flathub() {
         && ! grep -qx fedora <<<"$origins"; then
         missing+=("Fedora's duplicate Flatpak source disabled")
     fi
-    if [[ -n $TARGET_HOME ]] \
-        && ! grep -qx 'currentApplicationBackend=flatpak-backend' "$TARGET_HOME/.config/discoverrc" 2>/dev/null; then
+    # The file is in the user's home: only read a regular file, and don't hang on odd ones.
+    local discoverrc=$TARGET_HOME/.config/discoverrc
+    if [[ -n $TARGET_HOME ]] && ! { [[ -f $discoverrc ]] \
+        && timeout 5 grep -qx 'currentApplicationBackend=flatpak-backend' -- "$discoverrc" </dev/null 2>/dev/null; }; then
         missing+=("Flathub as Discover's default")
     fi
     if (( ${#missing[@]} == 0 )); then
@@ -2004,13 +2025,14 @@ install_rpmfusion() {
     if (( ! DRY_RUN )); then
         # Not $TMPDIR: the caller's environment mustn't choose where root keeps the downloads.
         install -d -m 1777 "$ROOT/tmp"
-        WORK_DIR=$(mktemp -d "$ROOT/tmp/fedora-kde-setup.XXXXXX")
+        [[ -n $WORK_DIR ]] || WORK_DIR=$(mktemp -d "$ROOT/tmp/fedora-kde-setup.XXXXXX")
     fi
 
-    local key file out files=()
+    local key file out keyring files=()
     for repo in "${repos[@]}"; do
         key=$keydir/RPM-GPG-KEY-rpmfusion-$repo-fedora-$release
         file=$WORK_DIR/rpmfusion-$repo-release.noarch.rpm
+        keyring=$WORK_DIR/keyring-$repo
         if (( DRY_RUN )); then
             log_cmd "rpmkeys --import $key"
             log_cmd "download $(rpmfusion_url "$repo")"
@@ -2031,7 +2053,15 @@ install_rpmfusion() {
             warn "Couldn't download the RPM Fusion $repo release package"
             return 1
         fi
-        if ! out=$(rpmkeys --checksig -- "$file" 2>&1) || [[ $out != "$file: digests signatures OK" ]]; then
+        # Check the signature against RPM Fusion's key alone, in a keyring of its own: the
+        # system keyring also trusts every other key ever imported (COPRs, Google, ...).
+        local -a own_keyring=(--dbpath "$keyring" --define "_keyringpath $keyring/pubkeys/")
+        if ! { install -d -m 0700 "$keyring" && rpmdb "${own_keyring[@]}" --initdb \
+               && rpmkeys "${own_keyring[@]}" --import "$key"; } &>/dev/null; then
+            warn "Couldn't set up a keyring to verify the RPM Fusion $repo release package"
+            return 1
+        fi
+        if ! out=$(rpmkeys "${own_keyring[@]}" --checksig -- "$file" 2>&1) || [[ $out != "$file: digests signatures OK" ]]; then
             warn "Signature check failed for the RPM Fusion $repo release package, refusing to install it: $out"
             return 1
         fi
@@ -2148,6 +2178,7 @@ setup_secure_boot_signing() {
     case $state in
         *"already enrolled"*|*"already in"*"db"*)
             ok "akmods signing key already enrolled"
+            rm -f -- "$MOK_PASSWORD_FILE"   # its one-time password isn't needed any more
             return 0
             ;;
         *"enrollment request"*)
@@ -2186,7 +2217,8 @@ setup_secure_boot_signing() {
         fi
         rm -f "$hash_file"
         (umask 077; printf '%s\n' "$MOK_GENERATED_PASSWORD" > "$MOK_PASSWORD_FILE")
-        warn "MOK one-time password: $MOK_GENERATED_PASSWORD (saved in $MOK_PASSWORD_FILE); you'll need it on the next boot"
+        # The password itself goes only to the terminal (in finish), never into the log.
+        warn "A one-time MOK password was created and saved in $MOK_PASSWORD_FILE; you'll need it on the next boot"
     fi
     MOK_PENDING=1
     ok "akmods signing key queued for enrollment"
@@ -2608,7 +2640,7 @@ finish() {
     if (( MOK_PENDING )); then
         local password_hint="the one-time password you just created"
         if [[ -n $MOK_GENERATED_PASSWORD ]]; then
-            password_hint="this one-time password: $MOK_GENERATED_PASSWORD (also saved in $MOK_PASSWORD_FILE)"
+            password_hint="the one-time password saved in $MOK_PASSWORD_FILE (show it: sudo cat $MOK_PASSWORD_FILE)"
         elif (( MOK_PREVIOUS )); then
             password_hint="the one-time password you set when the key was first queued (forgot it? sudo mokutil --revoke-import, then run the script again and pick the drivers step)"
         fi
@@ -2620,6 +2652,10 @@ ${C_BOLD}${C_YELLOW}Secure Boot key enrollment on next boot:${C_RESET}
   3. Type $password_hint, then choose "Reboot".
   If you miss it, run: sudo mokutil --import $MOK_CERT  and reboot again.
 MOK
+        if [[ -n $MOK_GENERATED_PASSWORD ]]; then
+            printf '  %sYour one-time password: %s%s  (shown only here, not in the log)\n' \
+                "$C_BOLD" "$MOK_GENERATED_PASSWORD" "$C_RESET" >/dev/tty 2>/dev/null || true
+        fi
     fi
 
     if (( DRY_RUN )); then
