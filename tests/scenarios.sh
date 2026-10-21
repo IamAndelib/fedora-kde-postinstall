@@ -2136,8 +2136,8 @@ menu_frames() {  # the text drawn inside the alternate screen, without escape se
     sed -e 's/\x1b\][^\x07]*\x07//g' -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\r$//' <<<"$raw"
 }
 
-menu_frames_fit_rows() {  # ROWS: every redraw (after a clear-screen) has fewer lines
-    local rows=$1 raw frame n
+max_frame_lines() {  # lines of the tallest menu redraw (between clear-screens)
+    local raw frame n max=0
     raw=$(<"$T/raw.txt")
     raw=${raw#*$'\e[?1049h'}
     raw=${raw%$'\e[?1049l'*}
@@ -2145,8 +2145,15 @@ menu_frames_fit_rows() {  # ROWS: every redraw (after a clear-screen) has fewer 
         raw=${raw#*$'\e[H\e[2J'}
         frame=${raw%%$'\e[H\e[2J'*}
         n=$(printf '%s' "$frame" | grep -c '')
-        (( n <= rows - 1 )) || return 1
+        (( n > max )) && max=$n
     done
+    echo "$max"
+}
+
+expect_frames_fit_rows() {  # ROWS: every redraw fits the terminal (one line left for the cursor)
+    local max
+    max=$(max_frame_lines)
+    check "every menu frame fits in $1 rows (tallest: $max lines)" test "$max" -le $(( $1 - 1 ))
 }
 
 menu_frames_fit() {  # WIDTH: no menu line is wider (in characters)
@@ -2160,7 +2167,7 @@ scenario menu_pick "pty" "Menu: select DNF and maintenance with arrows/Space, Co
 sc_menu_pick() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT=$(keys "$SPACE" "$(rep_key "$DOWN" 5)" "$SPACE" "$(rep_key "$DOWN" 3)" "$ENTER")$START_YES
+    PTY_INPUT=$(keys n "$SPACE" "$(rep_key "$DOWN" 5)" "$SPACE" "$(rep_key "$DOWN" 3)" "$ENTER")$START_YES
     invoke --no-reboot
     expect_success
     expect_menu_shown
@@ -2183,6 +2190,24 @@ sc_menu_pick() {
     expect_count "$(state_file)" . 2
     expect_out_fixed 'No reboot needed.'
     expect_no_out 'Reboot now'
+}
+
+scenario menu_default_selection "pty" "Menu: the recommended steps not done yet start selected; Continue right away reviews them"
+sc_menu_default_selection() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT=$(keys "$UP" "$UP" "$ENTER")$START_NO
+    invoke --no-reboot
+    expect_rc 0
+    expect_out 'Continue with 5 selected steps'
+    expect_out '^  Ready to start 5 steps'
+    local t
+    for t in "Faster DNF downloads" "Full system update" "Media codecs" "Flathub" "Firmware updates"; do
+        expect_will_do "$t"
+    done
+    expect_no_will_do 'SSD trim'
+    expect_no_will_do 'Remove'
+    expect_nothing_changed
 }
 
 scenario menu_recommended "pty" "Menu: r selects the recommended steps not done yet; n at the review: nothing changed"
@@ -2279,7 +2304,7 @@ sc_menu_vi_keys() {
     AUTO_ALL=0
     menu_machine
     # j j -> codecs (row 2), Space; Tab x6 -> Continue (row 8); Enter; n at the review.
-    PTY_INPUT=$(keys j j "$SPACE" "$(rep_key '\t' 6)" "$ENTER")$START_NO
+    PTY_INPUT=$(keys n j j "$SPACE" "$(rep_key '\t' 6)" "$ENTER")$START_NO
     invoke --no-reboot
     expect_will_do '1. Media codecs and video acceleration'
     expect_no_will_do 'Faster DNF'
@@ -2294,7 +2319,7 @@ scenario menu_ss3_arrows "pty" "Menu: application-mode arrows (ESC O B / ESC O A
 sc_menu_ss3_arrows() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT=$(keys '\eOB' "$SPACE" '\eOA' '\eOA' '\eOA' "$ENTER")$START_NO
+    PTY_INPUT=$(keys n '\eOB' "$SPACE" '\eOA' '\eOA' '\eOA' "$ENTER")$START_NO
     invoke --no-reboot
     expect_will_do '1. Full system update'
     expect_nothing_changed
@@ -2304,7 +2329,7 @@ scenario menu_toggle_off "pty" "Menu: Space twice unselects; nothing selected ->
 sc_menu_toggle_off() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT=$(keys "$SPACE" "$SPACE" "$UP" "$UP" "$ENTER" q)
+    PTY_INPUT=$(keys n "$SPACE" "$SPACE" "$UP" "$UP" "$ENTER" q)
     invoke --no-reboot
     expect_rc 0
     menu_row_selected 'Faster DNF downloads'
@@ -2336,7 +2361,7 @@ sc_menu_overview() {
     expect_out '^  ✔ Already done: DNF$'
     expect_out '^  – Not needed here: Drivers$'
     check "no selectable row for the done DNF step" not grep -Eq '\[[ x]\] +Faster DNF downloads' "$OUT"
-    expect_out '\[ \] +Full system update  • 3 updates available'
+    expect_out '\[[ x]\] +Full system update  • 3 updates available'
     expect_out '^  OPTIONAL$'
 }
 
@@ -2354,7 +2379,7 @@ sc_menu_sizes() {
     PTY_INPUT='q'
     invoke --no-reboot
     expect_rc 0
-    check "every menu frame fits in 18 rows" menu_frames_fit_rows 18
+    expect_frames_fit_rows 18
     expect_out '↓ [0-9]+ more line\(s\)'
     expect_out_fixed '↑↓ move · Enter select · ? help · q quit'
     expect_no_out 'r recommended'
@@ -2373,7 +2398,7 @@ sc_menu_tiny_terminal() {
     PTY_INPUT=$(keys "$(rep_key "$DOWN" 7)" q)
     invoke --no-reboot
     expect_rc 0
-    check "every menu frame fits in 14 rows (so the highlighted row stays visible)" menu_frames_fit_rows 14
+    expect_frames_fit_rows 14
 }
 
 scenario menu_all_done "pty" "Menu with nothing left: overview + 'Everything ... is already done', exit 0"
@@ -2384,7 +2409,7 @@ sc_menu_all_done() {
     invoke --no-reboot
     expect_rc 0
     expect_out_fixed 'Everything that applies to this computer is already done.'
-    expect_out 'To redo a step anyway: sudo bash .* --only <step> --force'
+    expect_out_fixed 'To redo a step anyway, run the setup again with: --only <step> --force   (see --list-steps)'
     expect_no_out 'Continue with'
     expect_no_pkg_change
 }
@@ -2394,7 +2419,7 @@ sc_menu_auto_update() {
     AUTO_ALL=0
     fx_gpu_nvidia "${NV_TU106[@]}"
     # Rows: 0 dnf, 1 update, 2 codecs, 3 drivers ... 9 Continue, 10 Quit.
-    PTY_INPUT=$(keys "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$UP" "$UP" "$SPACE" "$UP" "$UP" "$UP" "$ENTER")$START_NO
+    PTY_INPUT=$(keys n "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$UP" "$UP" "$SPACE" "$UP" "$UP" "$UP" "$ENTER")$START_NO
     invoke --no-reboot
     expect_out 'Full system update  • 3 updates available  \(needed by Drivers\)'
     expect_out_fixed 'The system update is needed by the drivers step; unselect the drivers first.'
@@ -2407,7 +2432,7 @@ scenario menu_untick_drivers "pty" "Menu: unselecting drivers also drops the aut
 sc_menu_untick_drivers() {
     AUTO_ALL=0
     fx_gpu_nvidia "${NV_TU106[@]}"
-    PTY_INPUT=$(keys "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$SPACE" "$(rep_key "$DOWN" 6)" "$ENTER" q)
+    PTY_INPUT=$(keys n "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$SPACE" "$(rep_key "$DOWN" 6)" "$ENTER" q)
     invoke --no-reboot
     expect_rc 0
     expect_out_fixed 'Select at least one step first'
@@ -2419,7 +2444,7 @@ sc_menu_sb_review() {
     AUTO_ALL=0
     fx_gpu_nvidia "${NV_TU106[@]}"
     fx_conf FKS_SB=enabled
-    PTY_INPUT=$(keys "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$(rep_key "$DOWN" 6)" "$ENTER")$START_YES
+    PTY_INPUT=$(keys n "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$(rep_key "$DOWN" 6)" "$ENTER")$START_YES
     invoke --no-reboot
     expect_success
     expect_out "Drivers: NVIDIA GeForce RTX 2060 Rev\\. A +Secure Boot: you'll set a one-time password right after this screen"
@@ -2434,7 +2459,7 @@ scenario menu_remove_pim "pty" "Menu: select KDE PIM; review shows what's delete
 sc_menu_remove_pim() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT=$(keys "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|delete\\n"
+    PTY_INPUT=$(keys n "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|delete\\n"
     invoke --no-reboot
     expect_success
     expect_out '^  REMOVE APPS YOU DON.T USE  \(deletes their data\)$'
@@ -2451,7 +2476,7 @@ scenario menu_remove_pim_keep "pty" "Menu: KDE PIM selected, Enter instead of 'd
 sc_menu_remove_pim_keep() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT=$(keys "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|\\n"
+    PTY_INPUT=$(keys n "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|\\n"
     invoke --no-reboot
     expect_rc 0
     expect_out_fixed 'OK, KDE PIM and its data are kept.'
@@ -2464,7 +2489,7 @@ sc_menu_remove_no_mail() {
     AUTO_ALL=0
     menu_machine
     rm -rf "$H/.local/share/local-mail" "$H/.local/share/contacts"
-    PTY_INPUT=$(keys "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")$START_YES
+    PTY_INPUT=$(keys n "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")$START_YES
     invoke --no-reboot
     expect_success
     expect_no_out 'to confirm'
@@ -2476,7 +2501,7 @@ sc_menu_remove_apps() {
     AUTO_ALL=0
     menu_machine
     fx_add remove_extra 'kmail kgpg'
-    PTY_INPUT=$(keys "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|delete\\n"
+    PTY_INPUT=$(keys n "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|delete\\n"
     invoke --no-reboot
     expect_success
     expect_out_fixed '      ! also removes these apps, which use its libraries: kgpg'
@@ -2495,7 +2520,7 @@ sc_menu_leftover() {
     expect_out '\[ \] +Remove leftover KDE PIM data  ◐ partly done: app removed'
     expect_no_will_do 'Remove leftover KDE PIM data'
     expect_nothing_changed
-    PTY_INPUT=$(keys "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|delete\\n"
+    PTY_INPUT=$(keys n "$(rep_key "$DOWN" 6)" "$SPACE" "$(rep_key "$DOWN" 2)" "$ENTER")"$START_YES|WAIT:to confirm|delete\\n"
     invoke --no-reboot
     expect_success
     expect_will_do '1. Remove leftover KDE PIM data'
