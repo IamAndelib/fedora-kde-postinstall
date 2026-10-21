@@ -16,6 +16,9 @@
 #   remove_extra    "TRIGGER PKG..." lines: a "remove ... --assumeno" that includes
 #                   TRIGGER (or any remove, for TRIGGER "*") also lists PKG...
 #   units           systemd units "systemctl cat" finds
+#   enabled_units   units "systemctl is-enabled" reports enabled ("enable" adds to it)
+#   modules         "KERNEL MODULE" lines: kernel modules that exist (akmods adds to it)
+#   updates_done    exists once "dnf5 upgrade --refresh" ran: check-upgrade then says 0
 #   pk_active       number of "systemctl is-active packagekit.service" calls still
 #                   answered "active"
 #   passwd          passwd(5) lines for getent / id
@@ -58,7 +61,9 @@ FKS_MOK_STATE=new           # new | enrolled | pending
 FKS_MOK_IMPORT_RC=0
 FKS_KMODGENCA_CREATES=1
 FKS_FWUPD_RC=2
-FKS_MODS_BUILT=1
+FKS_MODS_BUILT=1            # 0: akmods builds nothing
+FKS_UPDATES=3               # updates "dnf5 check-upgrade" lists (0 = up to date)
+FKS_CHECK_UPGRADE_RC=""     # force a check-upgrade exit code (e.g. 1 = error)
 FKS_MOD_SIGNER="akmods local signing key"
 FKS_PIM_RUNNING=0
 FKS_DATE="2026-01-02 03:04:05"
@@ -157,6 +162,19 @@ stub_dnf() {
             [[ -f $state/repos ]] && cat "$state/repos"
             return 0
             ;;
+        check-upgrade)
+            if [[ -n $FKS_CHECK_UPGRADE_RC ]]; then
+                echo "Error: Failed to download metadata" >&2
+                return "$FKS_CHECK_UPGRADE_RC"
+            fi
+            local n=$FKS_UPDATES i
+            [[ -e $state/updates_done ]] && n=0
+            (( n > 0 )) || return 0
+            for (( i = 1; i <= n; i++ )); do
+                printf 'pkg%d.x86_64  1.%d-1.fc%s  updates\n' "$i" "$i" "$FKS_FEDORA"
+            done
+            return 100
+            ;;
         history)
             printf 'ID Command line                          Date and time       Action(s) Altered\n'
             if [[ -n $FKS_HISTORY_LAST ]]; then
@@ -194,6 +212,10 @@ stub_dnf() {
             ;;
         install)
             for p in "${ops[@]}"; do
+                if [[ $p == /*.rpm ]]; then
+                    p=${p##*/}
+                    p=${p%.noarch.rpm}
+                fi
                 [[ $p == */* || $p == @* ]] && continue
                 if listed "$p" unavailable; then
                     (( skip )) && continue
@@ -210,8 +232,9 @@ stub_dnf() {
             add_line "${ops[1]}" installed
             ;;
         upgrade)
-            if [[ -n $FKS_UPGRADE_KERNEL && " $* " == *" --refresh "* ]]; then
-                add_line "$FKS_UPGRADE_KERNEL" kernels
+            if [[ " $* " == *" --refresh "* ]]; then
+                : > "$state/updates_done"
+                [[ -n $FKS_UPGRADE_KERNEL ]] && add_line "$FKS_UPGRADE_KERNEL" kernels
             fi
             ;;
         *) ;;  # config-manager, group, ...
@@ -331,6 +354,14 @@ stub_systemctl() {
             listed "${2:-}" units || { echo "No files found for ${2:-}." >&2; return 1; }
             echo "# /usr/lib/systemd/system/${2:-}"
             ;;
+        is-enabled)
+            if listed "${*: -1}" enabled_units; then echo enabled; return 0; fi
+            echo disabled
+            return 1
+            ;;
+        enable)
+            add_line "${*: -1}" enabled_units
+            ;;
         is-active)
             n=$(cat "$state/pk_active" 2>/dev/null || echo 0)
             if [[ ${*: -1} == packagekit.service ]] && (( n > 0 )); then
@@ -378,6 +409,31 @@ case $name in
     systemd-detect-virt) stub_detect_virt "$@" ;;
     systemctl) stub_systemctl "$@" ;;
     flatpak)
+        cfg=$root/var/lib/flatpak/repo/config
+        case ${1:-} in
+            remote-add)
+                mkdir -p "${cfg%/*}"
+                grep -qx '\[remote "flathub"\]' "$cfg" 2>/dev/null \
+                    || printf '[remote "flathub"]\nurl=https://dl.flathub.org/repo/\n' >> "$cfg"
+                ;;
+            remote-modify)
+                # --no-filter / --enable drop those keys from the remote's section;
+                # --disable adds xa.disable=true. (--prio is accepted and ignored.)
+                remote=${*: -1}
+                [[ -f $cfg ]] || { mkdir -p "${cfg%/*}"; : > "$cfg"; }
+                grep -qx "\\[remote \"$remote\"\\]" "$cfg" || printf '[remote "%s"]\n' "$remote" >> "$cfg"
+                drop="" add=""
+                [[ " $* " == *" --no-filter "* ]] && drop+="xa.filter "
+                [[ " $* " == *" --enable "* ]] && drop+="xa.disable "
+                [[ " $* " == *" --disable "* ]] && { drop+="xa.disable "; add="xa.disable=true"; }
+                awk -v sec="[remote \"$remote\"]" -v drop=" $drop" -v add="$add" '
+                    /^\[/ { if (insec && add != "") print add; insec = ($0 == sec) }
+                    { key = $0; sub(/=.*/, "", key)
+                      if (insec && index(drop, " " key " ")) next
+                      print }
+                    END { if (insec && add != "") print add }' "$cfg" > "$cfg.new" && mv "$cfg.new" "$cfg"
+                ;;
+        esac
         case "${1:-} ${2:-}" in
             "remotes --columns=name") [[ -f $state/flatpak_remotes ]] && cat "$state/flatpak_remotes" ;;
             "list --columns=origin") [[ -f $state/flatpak_origins ]] && cat "$state/flatpak_origins" ;;
@@ -447,7 +503,10 @@ case $name in
         ;;
     pkill) : > "$state/pim_killed" ;;
     modinfo)
-        (( FKS_MODS_BUILT )) || { echo "modinfo: ERROR: Module ${*: -1} not found." >&2; exit 1; }
+        # modinfo -k KERNEL [-F signer] MODULE: the module exists once akmods built it.
+        kernel=""
+        [[ ${1:-} == -k ]] && kernel=${2:-}
+        listed "$kernel ${*: -1}" modules || { echo "modinfo: ERROR: Module ${*: -1} not found." >&2; exit 1; }
         if [[ " $* " == *" -F signer "* ]]; then
             [[ -n $FKS_MOD_SIGNER ]] && echo "$FKS_MOD_SIGNER"
         fi
@@ -479,6 +538,10 @@ case $name in
             shift
             [[ ${1:-} == -w ]] && shift
         fi
+        # kwriteconfig6 runs (as its stub, which writes inside the scenario dir only).
+        if [[ ${1:-} == kwriteconfig6 ]]; then
+            exec "$stubdir/kwriteconfig6" "${@:2}"
+        fi
         if [[ ${1:-} == rm ]]; then
             for arg in "${@:2}"; do
                 [[ $arg == -* || $arg == "$scenario_dir"/* ]] && continue
@@ -488,6 +551,33 @@ case $name in
             exec "$@"
         fi
         ;;
-    sleep|sudo|akmods|akonadictl|kbuildsycoca6) ;;
+    akmods)
+        # akmods --force --kernels KERNEL: builds the modules of the installed akmod packages.
+        kernel=${*: -1}
+        if (( FKS_MODS_BUILT )); then
+            if grep -q '^akmod-nvidia' "$state/installed" 2>/dev/null; then add_line "$kernel nvidia" modules; fi
+            if listed broadcom-wl installed; then add_line "$kernel wl" modules; fi
+        fi
+        ;;
+    kwriteconfig6)
+        # kwriteconfig6 --file F --group G --key K VALUE
+        file="" group="" key="" value=""
+        while (( $# )); do
+            case $1 in
+                --file) file=$2; shift ;;
+                --group) group=$2; shift ;;
+                --key) key=$2; shift ;;
+                *) value=$1 ;;
+            esac
+            shift
+        done
+        [[ $file == "$scenario_dir"/* ]] || { echo "kwriteconfig6 stub: refusing to write $file" >&2; exit 1; }
+        mkdir -p "${file%/*}"
+        touch "$file"
+        grep -qx "\\[$group\\]" "$file" || printf '[%s]\n' "$group" >> "$file"
+        grep -v "^$key=" "$file" | awk -v g="[$group]" -v kv="$key=$value" '{ print } $0 == g { print kv }' > "$file.new"
+        mv "$file.new" "$file"
+        ;;
+    sleep|sudo|akonadictl|kbuildsycoca6) ;;
     *) echo "stub: no behaviour defined for '$name'" >&2; exit 127 ;;
 esac

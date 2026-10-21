@@ -8,12 +8,12 @@
 readonly FKS_STUB_COMMANDS=(
     dnf5 dnf rpm lspci lscpu mokutil systemd-detect-virt flatpak fwupdmgr systemctl
     curl getent id pgrep pkill sudo akmods kmodgenca modinfo akonadictl kbuildsycoca6
-    uname date openssl pkcon sleep runuser df rpmkeys
+    uname date openssl pkcon sleep runuser df rpmkeys kwriteconfig6
 )
 
 # Real tools the script (and the stubs) need; they only touch paths they are given,
 # which are all inside the scenario's temp dirs. (sleep is stubbed so polls don't wait.)
-readonly FKS_SAFE_TOOLS=(bash awk sed grep sort tail head cut tr tee install rm od cat mv mkdir find flock chmod mktemp stat)
+readonly FKS_SAFE_TOOLS=(bash awk sed grep sort tail head cut tr tee install rm od cat mv mkdir find flock chmod mktemp stat wc)
 
 # safebin_create DIR: symlink farm of the whitelisted real tools.
 safebin_create() {

@@ -208,6 +208,11 @@ fx_base() {
     fx_add units packagekit.service fstrim.timer
     fx_add flatpak_remotes fedora
     fx_add flatpak_origins
+    mkdir -p "$R/var/lib/flatpak/repo"
+    printf '[core]\nrepo_version=1\nmode=bare-split-xattrs\n[remote "fedora"]\nurl=oci+https://registry.fedoraproject.org\n' \
+        > "$R/var/lib/flatpak/repo/config"
+    fx_add enabled_units
+    fx_add modules
     local repo rel keydir=$R/usr/share/distribution-gpg-keys/rpmfusion
     mkdir -p "$keydir"
     for repo in free nonfree; do
@@ -227,4 +232,23 @@ fx_base() {
     mkdir -p "$T/home/John" "$T/home/2bob" "$T/home/.anna" "$T/home/123"
     fx_conf FKS_CPU_VENDOR=GenuineIntel "FKS_CPU_MODEL=12th Gen Intel(R) Core(TM) i7-1260P"
     fx_home_junk "$H"
+}
+
+# A KVM guest where every applicable step is already done (firmware doesn't apply in a VM).
+fx_fully_configured() {
+    fx_conf FKS_VIRT=kvm FKS_UPDATES=0
+    fx_pci 0000:00:01.0 0x030000 0x1af4 0x1050 "Red Hat, Inc. Virtio 1.0 GPU (rev 01)" virtio-pci
+    printf '[main]\nfastestmirror=True\nmax_parallel_downloads=10\ndefaultyes=True\n' > "$R/etc/dnf/dnf.conf"
+    fx_del installed "${FX_PIM[@]}" "${FX_OFFICE[@]}"
+    fx_add installed rpmfusion-free-release rpmfusion-nonfree-release ffmpeg gstreamer1-plugins-bad-freeworld \
+        gstreamer1-plugins-ugly gstreamer1-plugin-libav gstreamer1-plugin-openh264 qemu-guest-agent spice-vdagent
+    fx_del installed ffmpeg-free
+    rm -rf "${FX_JUNK[@]/#/$H/}"
+    printf '[core]\nmode=bare-split-xattrs\n[remote "fedora"]\nurl=oci+https://registry.fedoraproject.org\nxa.disable=true\n[remote "flathub"]\nurl=https://dl.flathub.org/repo/\n' \
+        > "$R/var/lib/flatpak/repo/config"
+    mkdir -p "$H/.config"
+    printf '[ResourcesModel]\ncurrentApplicationBackend=flatpak-backend\n' > "$H/.config/discoverrc"
+    fx_add enabled_units fstrim.timer
+    mkdir -p "$R/etc/systemd/journald.conf.d"
+    printf '[Journal]\nSystemMaxUse=500M\n' > "$R/etc/systemd/journald.conf.d/00-size.conf"
 }

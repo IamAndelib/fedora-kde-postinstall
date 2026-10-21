@@ -220,7 +220,7 @@ have_tty() { { : </dev/tty; } 2>/dev/null; }
 ask_yes_no() {  # $1 = prompt, $2 = default (y/n)
     local answer=""
     printf '%s%s%s ' "$C_BOLD" "$1" "$C_RESET"
-    read -r answer </dev/tty || answer=""
+    read -r answer </dev/tty || { printf '\n'; return 1; }
     answer=${answer:-$2}
     [[ $answer =~ ^[Yy] ]]
 }
@@ -397,8 +397,11 @@ resolve_target_user() {
             TARGET_USER=$(id -nu)
         fi
     fi
-    [[ -n $TARGET_USER ]] \
-        || die "Can't tell which user to clean up. Run it with sudo from your own account, or pass --user NAME."
+    if [[ -z $TARGET_USER ]]; then
+        # Only the KDE PIM / LibreOffice data cleanup needs it; checked once steps are chosen.
+        TARGET_HOME=""
+        return 0
+    fi
     if [[ $TARGET_USER == root ]]; then
         require "Refusing to clean root's home. Run it with sudo from your own account, or pass --user NAME."
     fi
@@ -526,16 +529,30 @@ preflight() {
 
     resolve_target_user
     read_state
-    ok "${FEDORA_NAME}, user '$TARGET_USER'"
+    ok "${FEDORA_NAME}, user '${TARGET_USER:-unknown}'"
+}
+
+probe() {  # $1 = URL; true if it answers over HTTPS
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsIL --max-time 20 -o /dev/null "$1"
 }
 
 check_network() {
     local url
-    url=$(rpmfusion_url free)
-    if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsIL --max-time 20 -o /dev/null "$url" \
-        && ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsIL --max-time 20 -o /dev/null \
-            "$(rpmfusion_url free download1.rpmfusion.org)"; then
-        require "Can't download $url. Check the internet connection; right after a new Fedora release RPM Fusion can lag a few days."
+    local needs_rpmfusion=0
+    if [[ -n ${SELECTED[codecs]:-} ]] || { [[ -n ${SELECTED[drivers]:-} ]] && (( DRIVERS_NEED_KMOD )); }; then
+        needs_rpmfusion=1
+    fi
+    if (( needs_rpmfusion )); then
+        url=$(rpmfusion_url free)
+        if ! probe "$url" && ! probe "$(rpmfusion_url free download1.rpmfusion.org)"; then
+            require "Can't download $url. Check the internet connection; right after a new Fedora release RPM Fusion can lag a few days."
+        fi
+    fi
+    if [[ -n ${SELECTED[update]:-}${SELECTED[firmware]:-} ]] && ! probe https://mirrors.fedoraproject.org/; then
+        require "Can't reach Fedora's mirrors (https://mirrors.fedoraproject.org). Check the internet connection."
+    fi
+    if [[ -n ${SELECTED[flathub]:-} ]] && ! probe https://dl.flathub.org/repo/flathub.flatpakrepo; then
+        require "Can't reach Flathub (https://dl.flathub.org). Check the internet connection."
     fi
 }
 
@@ -851,7 +868,11 @@ status_drivers() {
         if (( DRIVERS_WANT_NVIDIA )); then
             if is_installed akmod-nvidia || is_installed akmod-nvidia-580xx; then
                 have=$((have + 1))
-                modinfo -k "$running" nvidia &>/dev/null || missing+=("nvidia module for the running kernel")
+                if ! modinfo -k "$running" nvidia &>/dev/null; then
+                    missing+=("nvidia module for the running kernel")
+                elif [[ ! -d $ROOT/sys/module/nvidia ]]; then
+                    missing+=("a reboot to load it$( ((SECURE_BOOT)) && echo ' (and Secure Boot key enrollment)')")
+                fi
             else
                 missing+=("NVIDIA driver")
             fi
@@ -859,7 +880,11 @@ status_drivers() {
         if (( NEEDS_BROADCOM_WL )); then
             if is_installed broadcom-wl; then
                 have=$((have + 1))
-                modinfo -k "$running" wl &>/dev/null || missing+=("wl module for the running kernel")
+                if ! modinfo -k "$running" wl &>/dev/null; then
+                    missing+=("wl module for the running kernel")
+                elif [[ ! -d $ROOT/sys/module/wl ]]; then
+                    missing+=("a reboot to load it$( ((SECURE_BOOT)) && echo ' (and Secure Boot key enrollment)')")
+                fi
             else
                 missing+=("broadcom-wl")
             fi
@@ -961,7 +986,7 @@ status_firmware() {
 
 status_maintenance() {
     local good=0 dropin=$ROOT/etc/systemd/journald.conf.d/00-size.conf
-    if [[ $(systemctl is-enabled fstrim.timer 2>/dev/null || true) == enabled ]]; then
+    if (( IN_CONTAINER )) || [[ $(systemctl is-enabled fstrim.timer 2>/dev/null || true) == enabled ]]; then
         good=$((good + 1))
     fi
     if [[ -f $dropin ]] && grep -q '^SystemMaxUse=' "$dropin"; then
@@ -1102,7 +1127,12 @@ resolve_dependencies() {
     fi
     if [[ -n ${SELECTED[drivers]:-} && -z ${SELECTED[update]:-} ]] && (( DRIVERS_NEED_KMOD )) \
         && [[ ${STEP_STATUS[update]} != "done" ]]; then
-        SELECTED[update]=1 AUTO_SELECTED[update]=1
+        if [[ " ${SKIP_STEPS[*]} " == *" update "* ]]; then
+            unset 'SELECTED[drivers]'
+            warn "Skipped the drivers: they need the system update, which --skip leaves out"
+        else
+            SELECTED[update]=1 AUTO_SELECTED[update]=1
+        fi
     fi
 }
 
@@ -1180,7 +1210,8 @@ choose_steps_menu() {
                 n|none)
                     SELECTED=() AUTO_SELECTED=() ;;
                 *)
-                    if [[ $tok =~ ^[0-9]+$ ]] && (( tok >= 1 && tok <= n )); then
+                    if [[ $tok =~ ^[0-9]{1,2}$ ]] && (( 10#$tok >= 1 && 10#$tok <= n )); then
+                        tok=$((10#$tok))
                         id=${ALL_STEPS[tok - 1]}
                         if ! applicable "$id"; then
                             hint "Step $tok isn't available: ${STEP_NA[$id]}."
@@ -1345,8 +1376,9 @@ pause_packagekit() {
         fi
         ok "PackageKit paused until the script finishes"
     fi
-    # Only once PackageKit is idle: drop a staged offline update so it doesn't run on the next boot.
-    if [[ -e $ROOT/system-update || -L $ROOT/system-update ]]; then
+    # Only once PackageKit is idle, and only if this run updates the system itself: drop a
+    # staged offline update so the same updates don't run again on the next boot.
+    if [[ -n ${SELECTED[update]:-} ]] && [[ -e $ROOT/system-update || -L $ROOT/system-update ]]; then
         info "Cancelling a staged offline update; this script installs the same updates now"
         run pkcon offline-cancel >/dev/null 2>&1 || run rm -f "$ROOT/system-update"
     fi
@@ -1386,12 +1418,14 @@ step_dnf() {
 
 step_update() {
     info "This can take a while"
+    local history_before
+    history_before=$(last_transaction_id)
     KERNEL_BEFORE=$(newest_kernel)
     run "$DNF" upgrade --refresh -y
     NEWEST_KERNEL=$(newest_kernel)
     if [[ $NEWEST_KERNEL != "$KERNEL_BEFORE" ]]; then
         REBOOT_REASONS+=("to start the new kernel")
-    else
+    elif [[ $(last_transaction_id) != "$history_before" ]]; then
         REBOOT_REASONS+=("so updated system services and libraries are used")
     fi
     ok "System upgraded${NEWEST_KERNEL:+ (newest kernel: $NEWEST_KERNEL)}"
@@ -1409,7 +1443,10 @@ install_rpmfusion() {
         return 0
     fi
 
-    is_installed distribution-gpg-keys || run "$DNF" install -y distribution-gpg-keys
+    if ! is_installed distribution-gpg-keys && ! run "$DNF" install -y distribution-gpg-keys; then
+        warn "Couldn't install distribution-gpg-keys, so RPM Fusion can't be verified"
+        return 1
+    fi
     local release keydir=$ROOT/usr/share/distribution-gpg-keys/rpmfusion
     release=$(fedora_release_name)
     if (( ! DRY_RUN )); then
@@ -1429,29 +1466,40 @@ install_rpmfusion() {
             continue
         fi
         [[ -r $key ]] || key=$keydir/RPM-GPG-KEY-rpmfusion-$repo-fedora-latest
-        [[ -r $key ]] || die "RPM Fusion's signing key for Fedora $release isn't in distribution-gpg-keys ($keydir), so its packages can't be verified. Try again after the next Fedora update."
-        run rpmkeys --import "$key"
-        download "$(rpmfusion_url "$repo")" "$file" \
-            || download "$(rpmfusion_url "$repo" download1.rpmfusion.org)" "$file" \
-            || die "Couldn't download the RPM Fusion $repo release package"
+        if [[ ! -r $key ]]; then
+            warn "RPM Fusion's signing key for Fedora $release isn't in distribution-gpg-keys ($keydir), so its packages can't be verified. Try again after the next Fedora update."
+            return 1
+        fi
+        if ! run rpmkeys --import "$key"; then
+            warn "Couldn't import RPM Fusion's signing key"
+            return 1
+        fi
+        if ! download "$(rpmfusion_url "$repo")" "$file" \
+            && ! download "$(rpmfusion_url "$repo" download1.rpmfusion.org)" "$file"; then
+            warn "Couldn't download the RPM Fusion $repo release package"
+            return 1
+        fi
         if ! out=$(rpmkeys --checksig -- "$file" 2>&1) || [[ $out != "$file: digests signatures OK" ]]; then
-            die "Signature check failed for the RPM Fusion $repo release package, refusing to install it: $out"
+            warn "Signature check failed for the RPM Fusion $repo release package, refusing to install it: $out"
+            return 1
         fi
         if [[ $(rpm -qp --qf '%{NAME}' -- "$file" 2>/dev/null) != "rpmfusion-$repo-release" ]]; then
-            die "The downloaded file isn't the rpmfusion-$repo-release package, refusing to install it"
+            warn "The downloaded file isn't the rpmfusion-$repo-release package, refusing to install it"
+            return 1
         fi
         ok "RPM Fusion $repo release package signature verified"
         files+=("$file")
     done
     if (( DRY_RUN )); then
         log_cmd "$DNF install -y <verified rpmfusion-*-release packages>"
-    else
-        run "$DNF" install -y "${files[@]}"
+    elif ! run "$DNF" install -y "${files[@]}"; then
+        warn "Installing the RPM Fusion release packages failed"
+        return 1
     fi
 }
 
 enable_repos() {
-    install_rpmfusion
+    install_rpmfusion || return 1
 
     local enabled
     enabled=$("$DNF" repolist --enabled 2>/dev/null || true)
@@ -1470,7 +1518,11 @@ enable_repos() {
 }
 
 step_codecs() {
-    enable_repos
+    if ! enable_repos; then
+        warn "Skipped the codecs: they come from RPM Fusion, which couldn't be set up"
+        STEP_OK=0
+        return 0
+    fi
     if is_installed ffmpeg-free; then
         run "$DNF" swap -y ffmpeg-free ffmpeg --allowerasing || warn "Couldn't swap ffmpeg-free for ffmpeg"
     else
@@ -1678,8 +1730,10 @@ build_kmods() {
     for mod in "${mods[@]}"; do
         if ! modinfo -k "$NEWEST_KERNEL" "$mod" &>/dev/null; then
             warn "Kernel module '$mod' isn't built yet; akmods retries at boot (logs: /var/cache/akmods/)"
+            STEP_OK=0
         elif (( SECURE_BOOT )) && [[ -z $(modinfo -k "$NEWEST_KERNEL" -F signer "$mod" 2>/dev/null || true) ]]; then
             warn "Kernel module '$mod' is built but not signed; it won't load with Secure Boot on"
+            STEP_OK=0
         else
             ok "Kernel module '$mod' built for $NEWEST_KERNEL"
         fi
@@ -1694,7 +1748,11 @@ step_drivers() {
 
     local want_nvidia=$DRIVERS_WANT_NVIDIA want_wl=$NEEDS_BROADCOM_WL
     # The NVIDIA and wl drivers come from RPM Fusion.
-    install_rpmfusion
+    if ! install_rpmfusion; then
+        warn "Skipped the drivers: they come from RPM Fusion, which couldn't be set up"
+        STEP_OK=0
+        return 0
+    fi
 
     if (( (want_nvidia || want_wl) && SECURE_BOOT )); then
         if ! setup_secure_boot_signing; then
@@ -1711,6 +1769,10 @@ step_drivers() {
     fi
     if (( NVIDIA_INSTALLED || WL_INSTALLED )); then
         build_kmods
+        if { (( NVIDIA_INSTALLED )) && [[ ! -d $ROOT/sys/module/nvidia ]]; } \
+            || { (( WL_INSTALLED )) && [[ ! -d $ROOT/sys/module/wl ]]; }; then
+            REBOOT_REASONS+=("to load the new drivers")
+        fi
     fi
 }
 
@@ -1919,7 +1981,11 @@ step_flathub() {
 
 step_firmware() {
     command -v fwupdmgr &>/dev/null || dnf_install fwupd || true
-    run fwupdmgr refresh --force || warn "Couldn't refresh firmware metadata"
+    local refreshed=1
+    if ! run fwupdmgr refresh --force; then
+        warn "Couldn't refresh firmware metadata"
+        refreshed=0
+    fi
 
     local cmd=(fwupdmgr update -y --no-reboot-check --no-unreported-check)
     log_cmd "${cmd[*]}"
@@ -1931,7 +1997,7 @@ step_firmware() {
     case $rc in
         0) ok "Firmware updated (some updates are applied on reboot)"
            REBOOT_REASONS+=("to apply the firmware updates") ;;
-        2) ok "Firmware already up to date" ;;
+        2) if (( refreshed )); then ok "Firmware already up to date"; else STEP_OK=0; fi ;;
         *) warn "fwupdmgr exited with $rc; run 'fwupdmgr update' manually later (laptops must be on AC power)"
            STEP_OK=0 ;;
     esac
@@ -2035,6 +2101,9 @@ main() {
     if [[ -z $(selected_steps) ]]; then
         printf '\nNothing to do: the selected steps are already done (--force runs them again).\n'
         exit 0
+    fi
+    if [[ -n ${SELECTED[pim]:-}${SELECTED[libreoffice]:-} && -z $TARGET_HOME ]]; then
+        require "Can't tell whose KDE PIM/LibreOffice data to clean up. Run it with sudo from your own account, or pass --user NAME."
     fi
     if selection_touches_packages; then
         check_safety_rails

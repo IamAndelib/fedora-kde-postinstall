@@ -107,6 +107,7 @@ new_scenario_dirs() {  # $1 = scenario name
     EXPECT_ERRTRAP=0
     EXPECT_NO_LOG=0
     KEEP_ROOT_OWNER=0
+    AUTO_ALL=1
     LOCK_FD=""
     RC=""
     IS_DRY=0
@@ -142,6 +143,14 @@ release_lock() {
 #   user  as an unprivileged user (the harness user, or nobody when root)
 invoke() {
     local args=("$@") a
+    # v1.2 runs nothing unless steps are chosen: scenarios that don't choose get --all.
+    if (( AUTO_ALL )); then
+        local chosen=0
+        for a in "${args[@]}"; do
+            case $a in --only|--only=*|--all|--status|--list-steps|-h|--help|-V|--version) chosen=1 ;; esac
+        done
+        (( chosen )) || args=(--all "${args[@]}")
+    fi
     [[ $MODE == dry ]] && args=(--dry-run "${args[@]}")
     IS_DRY=0
     for a in "${args[@]}"; do [[ $a == -n || $a == --dry-run ]] && IS_DRY=1; done
