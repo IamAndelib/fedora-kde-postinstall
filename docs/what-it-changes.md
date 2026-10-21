@@ -55,7 +55,7 @@ The script looks at your system, not just at its own earlier runs, and shows eac
 | `update` | `dnf check-upgrade` finds no updates | Installs whatever is new |
 | `codecs` | RPM Fusion, full ffmpeg, the GStreamer plugins and your GPU's video driver are installed | Installs only what's missing |
 | `drivers` | The driver packages are installed and the module is built for your running kernel | Doesn't rebuild modules that already exist |
-| `pim` / `libreoffice` | The apps aren't installed | If the apps are gone but their data is still in your home folder, the step becomes "Remove leftover … data". It's never ticked by `r`, `a` or `--all`, so leftover data is only deleted when you tick it yourself. |
+| `pim` / `libreoffice` | The apps aren't installed | If the apps are gone but their data is still in your home folder, the step becomes "Remove leftover … data". Like the removals themselves, it's never selected by `r`, `a` or `--all`, so data is only deleted when you select it yourself. |
 | `flathub` | Flathub is enabled without a filter, Fedora's duplicate source is off, and Flatpak is Discover's default | Fixes only what's missing |
 | `firmware` | Can't be known without asking the vendor server; shows when it was last checked | Checks again |
 | `maintenance` | `fstrim.timer` is enabled and the journal size cap is in place | Writes the same settings again |
@@ -114,7 +114,9 @@ On a fresh install these hold nothing important. **If you've already used KMail,
 ## Safety checks
 
 - **Dry run:** `--dry-run` prints every command without running any.
-- **You choose:** nothing is ticked by default, and nothing changes until you confirm your choice. `--yes` needs an explicit `--only` or `--all`.
+- **You choose:** nothing is selected by default, and nothing changes until you confirm on the review screen. `--yes` needs an explicit `--only` or `--all`.
+- **Removals are never implied:** `r`, `a` and `--all` never select the KDE PIM or LibreOffice removal. The review screen shows how much data each removal deletes and which other apps would go with it. Real mail or contacts need you to type `delete`.
+- **No surprises mid-run:** questions (Secure Boot password, removals) are asked before the long part starts. Keys pressed while it runs are thrown away, so a stray Enter can't answer the reboot question.
 - **Stops before starting if something's off:** wrong CPU architecture; and, when you picked steps that change packages, low disk space, running on battery, a broken package database, or another package manager already running.
 - **Verified downloads:**
   - Everything is downloaded over HTTPS only, including redirects.

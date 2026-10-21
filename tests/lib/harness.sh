@@ -195,7 +195,7 @@ invoke() {
         pty)
             local cmdline
             cmdline=$(printf '%q ' "${cmd[@]}")
-            printf '%b' "$PTY_INPUT" \
+            feed_pty_input "$PTY_INPUT" \
                 | ( cd "$T/cwd" && "${isolate[@]}" "$SCRIPT_BIN" -qec "$cmdline" /dev/null ) 2>&1 \
                 | cat > "$T/raw.txt"
             RC=${PIPESTATUS[1]}
@@ -212,8 +212,9 @@ invoke() {
             ;;
     esac
 
-    # Plain text: no colors, no carriage returns from the pty.
-    sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\r$//' "$T/raw.txt" > "$OUT"
+    # Plain text: no escape sequences (colors, cursor, clear screen, window title), no
+    # carriage returns from the pty.
+    sed -e 's/\x1b\][^\x07]*\x07//g' -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' -e 's/\r$//' "$T/raw.txt" > "$OUT"
     if (( IS_DRY )); then
         sed -n 's/^  \$ //p' "$OUT" > "$T/actions"
     else
@@ -245,6 +246,19 @@ invoke() {
         fi
         check "nothing written to the host's /var/log" test -z "$(ls -A "$T/hostlog")"
     fi
+}
+
+# Keys for the pty, printf %b style. "|PAUSE|" waits 2 s, so a key arrives while the
+# script is already waiting for it (needed for Ctrl-C / Ctrl-D in the menu).
+feed_pty_input() {
+    local rest=$1 part
+    while [[ $rest == *"|PAUSE|"* ]]; do
+        part=${rest%%"|PAUSE|"*}
+        rest=${rest#*"|PAUSE|"}
+        printf '%b' "$part"
+        sleep 2
+    done
+    printf '%b' "$rest"
 }
 
 no_mutating_calls() {

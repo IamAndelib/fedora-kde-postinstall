@@ -19,7 +19,7 @@
 | ○ | Remove LibreOffice | Removes the office suite **and deletes its settings**. |
 | ○ | SSD trim + smaller logs | Weekly SSD trim; system logs capped at 500 MB. |
 
-⭐ = **Recommended** for almost everyone · ○ = **Optional**, up to you. Every step is explained in the checklist itself. Want every detail? See [exactly what it changes](docs/what-it-changes.md).
+⭐ = **Recommended** for almost everyone · ○ = **Optional**, up to you. Every step is explained in the checklist itself. The two removals are listed separately and are never selected for you.
 
 Want every detail? See [exactly what it changes](docs/what-it-changes.md).
 
@@ -85,27 +85,45 @@ You'll see your hardware (CPU, graphics, Wi-Fi…), what's already done, and the
 sudo bash fedora-kde-setup.sh
 ```
 
-It shows a colored checklist. Nothing is ticked at first:
+It opens a checklist. What's already done is listed at the top; below it are only the steps you can still choose, grouped. Nothing is selected at first:
 
 ```
-  Already done: 1   Partly done: 1   Not done yet: 6
+  Fedora KDE setup: choose what to do
+  ✔ Already done: DNF, Codecs
+  – Not needed here: Firmware
 
-  1. [ ] Faster DNF downloads [Recommended]
-        Picks the fastest mirror and downloads 10 files at once, so updates finish sooner.
-  2. [ ] Full system update [Recommended]  • 37 updates available
+  RECOMMENDED
+  > [ ] Full system update  • 12 updates available
         Installs all pending updates: security fixes, bug fixes and newer apps.
-  ...
-  6. [ ] Remove LibreOffice [Optional]
-        Removes the office suite if you use something else. Deletes its settings.
-  ...
-  Type numbers to tick/untick (e.g. "1 3 5"), r = all recommended, a = everything not done yet,
-  n = none, Enter = continue, q = quit
->
+    [ ] Drivers: NVIDIA GeForce RTX 4060
+    [ ] Flathub as Discover's app store  ◐ partly done: missing …
+
+  OPTIONAL
+    [ ] SSD trim + smaller system logs
+
+  REMOVE APPS YOU DON'T USE  (deletes their data)
+    [ ] Remove KDE PIM (KMail, Kontact, KOrganizer...)  • currently installed
+    [ ] Remove LibreOffice  • currently installed
+
+    ▶ Continue with 0 selected steps
+    Quit without changes
+
+  ↑↓ move · Enter select · r recommended · a all · n none · ? help · q quit
 ```
 
-1. **Tick what you want.** Type **`r`** and press **Enter** to tick all ⭐ recommended steps. Add or remove single steps by typing their numbers, for example `5 6` to also remove KDE PIM and LibreOffice.
-2. **Press Enter** on an empty line to continue. It lists what it will do and asks `Proceed? [y/N]`; type **`y`**.
-3. It then works on its own, with a **progress bar** showing how far along it is. A full run takes **about 15–60 minutes**, depending on your internet speed and hardware.
+1. **Select what you want.**
+   - Press **`r`** to select all recommended steps.
+   - Use the **arrow keys** to move, and **Enter** (or Space) to select or unselect a step.
+   - The removals are never selected for you: `a` ("all") skips them too.
+   - Press **`?`** for help, or **`q`** to quit without changing anything.
+2. **Move down to `▶ Continue` and press Enter.** A review screen shows:
+   - every step, and roughly how long it takes;
+   - for removals, exactly how much data gets deleted and which other apps would go too;
+   - whether a reboot will be needed.
+
+   Type **`y`** to start. If you chose to remove KDE PIM and there's real mail or contacts in your home folder, you'll also be asked to type `delete`.
+3. **Answer anything else now.** Questions such as the Secure Boot password come right after this, before the long part, so you can walk away.
+4. **Let it run.** Each step shows `Step 2 of 5 · …` with a progress bar, and ends with `✔ Step 2 of 5 done (12 min)`. A full run takes **about 15–60 minutes**, depending on your internet speed and hardware.
 
 > [!WARNING]
 > Keep the Konsole window open, and keep a laptop **plugged in** until it's finished.
@@ -155,14 +173,16 @@ Most people never need these; the checklist does everything.
 | `--dry-run` | Show what would happen and every command, but change nothing |
 | `--list-steps` | List the step names used by `--only` and `--skip` |
 | `--only dnf,codecs` | Run only these steps, without the checklist |
-| `--all` | Run every step that applies and isn't done yet |
+| `--all` | Run every step that applies and isn't done yet, **except the app removals** |
 | `--skip pim,libreoffice` | With `--all`: leave these steps out |
 | `--yes` | Don't ask questions (needs `--only` or `--all`) |
 | `--force` | With `--only`/`--all`: also redo steps that are already done |
 | `--no-reboot` | Don't offer to reboot at the end |
 | `--user NAME` | Clean up this user's data instead of yours |
 
-Example (everything except the removals, no questions): `sudo bash fedora-kde-setup.sh --all --skip pim,libreoffice --yes`
+Examples:
+- Everything except the removals, no questions: `sudo bash fedora-kde-setup.sh --all --yes`
+- Also remove LibreOffice: `sudo bash fedora-kde-setup.sh --all --yes` then `sudo bash fedora-kde-setup.sh --only libreoffice --yes`
 
 Step names: `dnf`, `update`, `codecs`, `drivers`, `pim`, `libreoffice`, `flathub`, `firmware`, `maintenance`.
 

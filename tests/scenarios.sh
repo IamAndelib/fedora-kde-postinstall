@@ -1322,7 +1322,7 @@ sc_legacy_marker() {
     fx_marker "2025-05-05 10:00:00"
     invoke --status
     expect_rc 0
-    expect_out 'Firmware updates \[Recommended\]  • last checked 2025-05-05'
+    expect_status_todo 'Firmware updates' '• last checked 2025-05-05'
     expect_no_out 'already completed'
     invoke --only dnf --yes --no-reboot
     expect_success
@@ -2068,16 +2068,23 @@ sc_user_digits() {
 # ===========================================================================
 # v1.2: choosing steps, status detection, progress, reboot advice
 
-# Menu sessions run on a pty without --all/--only. Base machine = Intel laptop, where the
-# step numbers are: 1 dnf, 2 update, 3 codecs, 4 drivers (n/a), 5 pim, 6 libreoffice,
-# 7 flathub, 8 firmware, 9 maintenance.
+# The menu is keyboard-driven on /dev/tty. Base machine = Intel laptop; its selectable
+# rows are 0 dnf, 1 update, 2 codecs, 3 pim, 4 libreoffice, 5 flathub, 6 firmware,
+# 7 maintenance, then 8 "Continue", 9 "Quit" (drivers isn't needed there). Moving wraps.
+readonly UP='\e[A' DOWN='\e[B' ENTER='\n' SPACE=' '
 menu_machine() { fx_gpu_intel; fx_wifi_intel; fx_wifi_phy 0000:00:14.3; fx_battery; }
+keys() { local k out=""; for k in "$@"; do out+=$k; done; printf '%s' "$out"; }
+rep_key() { local i out=""; for (( i = 0; i < $2; i++ )); do out+=$1; done; printf '%s' "$out"; }
 
 expect_menu_shown() {
-    expect_out 'Already done: [0-9]+   Partly done: [0-9]+   Not done yet: [0-9]+$'
-    expect_out_fixed '[✔] already done   [◐] partly done   [ ] not done yet   [x] selected'
-    expect_out_fixed 'Type numbers to select/unselect (e.g. "1 3 5"; selecting a [✔] step redoes it), r = all recommended not done yet,'
-    expect_out_fixed 'a = everything not done yet, n = none, Enter = continue, q = quit'
+    expect_out '^  Fedora KDE setup: choose what to do$'
+    expect_out '^  ✔ Already done on this computer$'
+    expect_out '^  Select what to do   ↑/↓ move · Enter/Space select · r recommended · a all · n none · q quit$'
+    expect_out '^      ▶ Continue with [0-9]+ selected steps?$|❯  ▶ Continue with'
+    expect_out 'Quit without changes'
+    check "cursor hidden during the menu" grep -q $'\e\\[?25l' "$T/raw.txt"
+    check "cursor shown again afterwards" grep -q $'\e\\[?25h' "$T/raw.txt"
+    check "screen cleared on redraw" grep -q $'\e\\[H\e\\[2J' "$T/raw.txt"
 }
 
 expect_nothing_changed() {  # menu left without running anything
@@ -2088,16 +2095,25 @@ expect_nothing_changed() {  # menu left without running anything
     expect_home_intact "$H"
 }
 
-scenario menu_pick "pty" "Menu: pick 1 and 9, Enter, y: only DNF + maintenance run; no rails/network/PackageKit"
+last_cursor_shown() {  # the last cursor show/hide sequence in the raw output is "show"
+    [[ $(grep -ao $'\e\[?25[lh]' "$T/raw.txt" | tail -n1) == $'\e[?25h' ]]
+}
+
+menu_row_selected() {  # TITLE_RE: some redraw shows the row ticked
+    expect_out "\\[x\\] +$1 +\\[(Recommended|Optional)\\]"
+}
+
+scenario menu_pick "pty" "Menu: Space on DNF, Up×3 to maintenance (wrapping), Space, Down to Continue, Enter, y"
 sc_menu_pick() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT='1 9\n\ny\n'
+    PTY_INPUT=$(keys "$SPACE" "$UP" "$UP" "$UP" "$SPACE" "$DOWN" "$ENTER" 'y\n')
     invoke --no-reboot
     expect_success
     expect_menu_shown
-    expect_out '^  1\. \[x\] Faster DNF downloads \[Recommended\]'
-    expect_out '^  9\. \[x\] SSD trim \+ smaller system logs \[Optional\]'
+    menu_row_selected 'Faster DNF downloads'
+    menu_row_selected 'SSD trim \+ smaller system logs'
+    expect_out 'Continue with 2 selected steps'
     expect_will_do '1. Faster DNF downloads'
     expect_will_do '2. SSD trim + smaller system logs'
     expect_no_will_do 'Full system update'
@@ -2114,162 +2130,192 @@ sc_menu_pick() {
     expect_no_out 'Reboot now'
 }
 
-scenario menu_recommended "pty" "Menu: r picks the recommended steps not done yet; n at Proceed aborts"
+scenario menu_recommended "pty" "Menu: r selects the recommended steps not done yet; n at Proceed aborts"
 sc_menu_recommended() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT='r\n\nn\n'
+    PTY_INPUT=$(keys r "$UP" "$UP" "$ENTER" 'n\n')
     invoke --no-reboot
     expect_rc 1
     local t
     for t in "Faster DNF downloads" "Full system update" "Media codecs and video acceleration" \
         "Flathub as Discover's app store" "Firmware updates"; do expect_will_do "$t"; done
     for t in "Remove KDE PIM" "Remove LibreOffice" "SSD trim" "Drivers"; do expect_no_will_do "$t"; done
+    expect_out 'Continue with 5 selected steps'
     expect_out 'Aborted, nothing was changed'
     expect_nothing_changed
 }
 
-scenario menu_everything "pty" "Menu: a picks everything not done yet (incl. optional)"
+scenario menu_everything "pty" "Menu: a selects everything not done yet (incl. optional)"
 sc_menu_everything() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT='a\n\nn\n'
+    PTY_INPUT=$(keys a "$UP" "$UP" "$ENTER" 'n\n')
     invoke --no-reboot
     local t
     for t in "Faster DNF downloads" "Full system update" "Media codecs" "Remove KDE PIM" \
         "Remove LibreOffice" "Flathub" "Firmware updates" "SSD trim"; do expect_will_do "$t"; done
     expect_no_will_do 'Drivers'
+    expect_out 'Continue with 8 selected steps'
     expect_nothing_changed
 }
 
-scenario menu_none_enter_quit "pty" "Menu: r, then n, Enter with nothing selected re-asks; q quits with exit 0"
-sc_menu_none_enter_quit() {
+scenario menu_none_continue "pty" "Menu: r then n, Enter on Continue with nothing selected: message; q quits (exit 0)"
+sc_menu_none_continue() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT='r\nn\n\nq\n'
+    PTY_INPUT=$(keys r n "$UP" "$UP" "$ENTER" q)
     invoke --no-reboot
     expect_rc 0
-    expect_out_fixed 'Nothing selected yet: type the numbers of the steps you want (or r for the recommended ones).'
+    expect_out 'Continue with 0 selected steps'
+    expect_out_fixed 'Select at least one step first: move to it and press Enter or Space.'
     expect_out '^Nothing was changed\.$'
     expect_no_out 'Will do:'
     expect_nothing_changed
 }
 
-scenario menu_invalid_input "pty" "Menu: bad tokens and an n/a step give hints, menu stays"
-sc_menu_invalid_input() {
+scenario menu_quit_keys "pty" "Menu: q, Esc, the Quit row, and closed input all quit with exit 0, nothing changed"
+sc_menu_quit_keys() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT='x 42 4 1.5\nq\n'
-    invoke --no-reboot
-    expect_rc 0
-    expect_out_fixed '"x" isn'"'"'t a step number between 1 and 9.'
-    expect_out_fixed '"42" isn'"'"'t a step number between 1 and 9.'
-    expect_out_fixed '"1.5" isn'"'"'t a step number between 1 and 9.'
-    expect_out_fixed "Step 4 isn't available: nothing needed: your graphics and Wi-Fi use built-in drivers."
-    expect_nothing_changed
+    local input
+    for input in q Q '\e' "$UP$ENTER" "$UP$SPACE" ''; do
+        PTY_INPUT=$input
+        invoke --no-reboot
+        expect_rc 0
+        expect_out '^Nothing was changed\.$'
+        expect_no_out 'Will do:'
+        expect_nothing_changed
+    done
 }
 
-scenario menu_quit "pty" "Menu: q right away: exit 0, nothing changed, no lock"
-sc_menu_quit() {
+scenario menu_ctrl_d "pty" "Menu: Ctrl-D typed while the menu waits: quits, nothing changed"
+sc_menu_ctrl_d() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT='q\n'
+    PTY_INPUT="$DOWN|PAUSE|\\x04"
     invoke --no-reboot
     expect_rc 0
-    expect_menu_shown
     expect_out '^Nothing was changed\.$'
     expect_nothing_changed
 }
 
-scenario menu_eof "pty" "Menu: input closed (Ctrl-D): aborted, nothing changed"
-sc_menu_eof() {
+scenario menu_ctrl_c "pty" "Menu: Ctrl-C while the menu waits: Interrupted, cursor restored, nothing changed"
+sc_menu_ctrl_c() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT=''
+    PTY_INPUT="$SPACE|PAUSE|\\x03"
     invoke --no-reboot
-    expect_rc 1
-    expect_out 'Aborted, nothing was changed'
+    expect_rc nonzero
+    expect_out 'Interrupted'
+    check "cursor shown again after Ctrl-C" last_cursor_shown
     expect_nothing_changed
 }
 
-scenario menu_decimal "pty" "Menu: 08 and 09 are decimal step numbers (no octal error)"
-sc_menu_decimal() {
+scenario menu_vi_keys "pty" "Menu: j/k/Tab move; k from the top wraps to Quit"
+sc_menu_vi_keys() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT='08 09\n\nn\n'
+    # j j -> codecs, Space; Tab x6 -> Continue (row 8); Enter; n at Proceed.
+    PTY_INPUT=$(keys j j "$SPACE" "$(rep_key '\t' 6)" "$ENTER" 'n\n')
     invoke --no-reboot
-    expect_will_do '1. Firmware updates'
-    expect_will_do '2. SSD trim + smaller system logs'
-    expect_no_out 'value too great for base'
-    expect_no_out "isn't a step number"
+    expect_will_do '1. Media codecs and video acceleration'
+    expect_no_will_do 'Faster DNF'
+    expect_nothing_changed
+    # k from row 0 wraps to "Quit without changes"; Enter there quits.
+    PTY_INPUT=$(keys k "$ENTER")
+    invoke --no-reboot
+    expect_rc 0
+    expect_out '^Nothing was changed\.$'
+}
+
+scenario menu_ss3_arrows "pty" "Menu: application-mode arrows (ESC O B / ESC O A) move too"
+sc_menu_ss3_arrows() {
+    AUTO_ALL=0
+    menu_machine
+    PTY_INPUT=$(keys '\eOB' "$SPACE" '\eOA' '\eOA' '\eOA' "$ENTER" 'n\n')
+    invoke --no-reboot
+    expect_will_do '1. Full system update'
     expect_nothing_changed
 }
 
-scenario menu_toggle_off "pty" "Menu: selecting a step twice unselects it"
+scenario menu_toggle_off "pty" "Menu: Space twice unselects; nothing selected -> message"
 sc_menu_toggle_off() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT='1\n1\n\nq\n'
+    PTY_INPUT=$(keys "$SPACE" "$SPACE" "$UP" "$UP" "$ENTER" q)
     invoke --no-reboot
     expect_rc 0
-    expect_out '^  1\. \[x\] Faster DNF downloads'
-    expect_out_fixed 'Nothing selected yet'
+    menu_row_selected 'Faster DNF downloads'
+    expect_out_fixed 'Select at least one step first'
     expect_nothing_changed
 }
 
-scenario menu_redo_done "pty" "Menu: a done step shows [✔]; selecting it redoes it"
-sc_menu_redo_done() {
+scenario menu_done_overview "pty" "Menu: done steps are listed read-only on top, not selectable; n/a steps shown separately"
+sc_menu_done_overview() {
     AUTO_ALL=0
     menu_machine
     printf '[main]\nfastestmirror=True\nmax_parallel_downloads=10\ndefaultyes=True\n' > "$R/etc/dnf/dnf.conf"
-    cp "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
-    PTY_INPUT='1\n\ny\n'
+    PTY_INPUT='q'
     invoke --no-reboot
-    expect_success
-    expect_out '^  1\. \[✔\] Faster DNF downloads \[Recommended\]  ✔ already set$'
-    expect_out '^  1\. \[x\] Faster DNF downloads'
-    expect_will_do '1. Faster DNF downloads'
-    expect_out 'fastestmirror is already set'
-    expect_out 'Kept your max_parallel_downloads=10'
-    check "dnf.conf byte-identical after redo" cmp -s "$R/etc/dnf/dnf.conf" "$T/dnf.conf.before"
-    expect_recorded dnf
+    expect_rc 0
+    expect_out '^      ✔ Faster DNF downloads \(already set\)$'
+    expect_out '^  – Not needed on this computer$'
+    expect_out_fixed '      Drivers for your hardware (nothing needed: your graphics and Wi-Fi use built-in drivers)'
+    check "no selectable row for the done DNF step" not grep -Eq '\[[ x]\] +Faster DNF downloads' "$OUT"
+    expect_out '\[ \] +Full system update +\[Recommended\]  • 3 updates available'
 }
 
-scenario menu_auto_update "pty" "Menu: drivers auto-selects the update; unticking the update is refused"
+scenario menu_all_done "pty" "Menu with nothing left to do: overview + 'Everything ... is already done', exit 0"
+sc_menu_all_done() {
+    AUTO_ALL=0
+    fx_fully_configured
+    PTY_INPUT=''
+    invoke --no-reboot
+    expect_rc 0
+    expect_out_fixed 'Everything that applies to this computer is already done.'
+    expect_out 'To redo a step anyway: sudo bash .* --only <step> --force'
+    expect_no_out 'Select what to do'
+    expect_no_pkg_change
+}
+
+scenario menu_auto_update "pty" "Menu: drivers auto-selects the update; unselecting the update is refused"
 sc_menu_auto_update() {
     AUTO_ALL=0
     fx_gpu_nvidia "${NV_TU106[@]}"
-    PTY_INPUT='4\n2\n\nn\n'
+    # Rows: 0 dnf, 1 update, 2 codecs, 3 drivers, ..., 8 maintenance, 9 Continue, 10 Quit.
+    PTY_INPUT=$(keys "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$UP" "$UP" "$SPACE" "$UP" "$UP" "$UP" "$ENTER" 'n\n')
     invoke --no-reboot
-    expect_out '^  2\. \[x\] Full system update \[Recommended\]  • 3 updates available \(needed by Drivers\)$'
-    expect_out_fixed 'Step 2 is needed by the drivers step; untick that one first.'
+    expect_out 'Full system update .*\(needed by Drivers\)$'
+    expect_out_fixed 'This step is needed by the drivers step; unselect that one first.'
     expect_will_do 'Full system update  (needed by Drivers)'
     expect_will_do 'Drivers: NVIDIA GeForce RTX 2060 Rev. A'
     expect_nothing_changed
 }
 
-scenario menu_untick_drivers "pty" "Menu: unticking drivers also drops the auto-selected update"
+scenario menu_untick_drivers "pty" "Menu: unselecting drivers also drops the auto-selected update"
 sc_menu_untick_drivers() {
     AUTO_ALL=0
     fx_gpu_nvidia "${NV_TU106[@]}"
-    PTY_INPUT='4\n4\n\nq\n'
+    PTY_INPUT=$(keys "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$SPACE" "$(rep_key "$DOWN" 6)" "$ENTER" q)
     invoke --no-reboot
     expect_rc 0
-    expect_out_fixed 'Nothing selected yet'
+    expect_out_fixed 'Select at least one step first'
     expect_nothing_changed
 }
 
-scenario menu_leftover "pty" "Menu: leftover PIM data is never picked by a/r; picking 5 cleans it"
+scenario menu_leftover "pty" "Menu: leftover PIM data is never selected by a/r; selecting it explicitly cleans it"
 sc_menu_leftover() {
     AUTO_ALL=0
     menu_machine
     fx_del installed "${FX_PIM[@]}"
-    PTY_INPUT='a\n\nn\n'
+    PTY_INPUT=$(keys a "$UP" "$UP" "$ENTER" 'n\n')
     invoke --no-reboot
-    expect_out '^  5\. \[◐\] Remove leftover KDE PIM data \[Optional\]  ◐ partly done: app removed, data still in your home folder$'
+    expect_out '\[ \] +Remove leftover KDE PIM data +\[Optional\]  ◐ partly done: app removed, data still in your home folder'
     expect_no_will_do 'Remove leftover KDE PIM data'
     expect_nothing_changed
-    PTY_INPUT='5\n\ny\n'
+    # Rows: 0 dnf, 1 update, 2 codecs, 3 pim (leftover), ... 7 maintenance, 8 Continue.
+    PTY_INPUT=$(keys "$DOWN" "$DOWN" "$DOWN" "$SPACE" "$(rep_key "$DOWN" 5)" "$ENTER" 'y\n')
     invoke --no-reboot
     expect_success
     expect_will_do '1. Remove leftover KDE PIM data'
@@ -2278,13 +2324,14 @@ sc_menu_leftover() {
     expect_recorded pim
 }
 
-scenario menu_full_run "pty" "Menu: r + 9, run everything picked, decline the reboot"
+scenario menu_full_run "pty" "Menu: r + maintenance, run everything selected, decline the reboot"
 sc_menu_full_run() {
     AUTO_ALL=0
     menu_machine
-    PTY_INPUT='r 9\n\ny\nn\n'
+    PTY_INPUT=$(keys r "$UP" "$UP" "$UP" "$SPACE" "$DOWN" "$ENTER" 'y\n' 'n\n')
     invoke
     expect_success
+    expect_menu_shown
     expect_out 'Reboot now\? \(recommended\) \[Y/n\]'
     expect_out_fixed 'OK. Remember to reboot soon.'
     expect_no_call '^systemctl reboot'
@@ -2511,7 +2558,7 @@ scenario dnfconf_keep_higher "live" "dnf.conf: keeps max_parallel_downloads=20 a
 sc_dnfconf_keep_higher() {
     printf '[main]\nfastestmirror=1\nmax_parallel_downloads=20\n' > "$R/etc/dnf/dnf.conf"
     invoke --status
-    expect_out 'Faster DNF downloads \[Recommended\]  ◐ partly done: some settings missing'
+    expect_status_todo 'Faster DNF downloads' '◐ partly done: some settings missing'
     invoke --only dnf --yes --no-reboot
     expect_success
     expect_out 'fastestmirror is already set'
@@ -2523,21 +2570,24 @@ sc_dnfconf_keep_higher() {
 }
 
 # --- Status detection ------------------------------------------------------------
+# --status prints the overview ("✔ Already done", "– Not needed") and a "Still to do" list.
 
-expect_status_line() {  # NUMBER BOX TITLE_RE [BADGE_RE]
-    expect_out "^  $1\\. \\[$2\\] $3 \\[(Recommended|Optional)\\]  ${4:-}\$"
-}
+expect_status_done() { expect_out "^      ✔ $1 \\($2\\)\$"; }
+expect_status_todo() { expect_out "^      \\[ \\] $1  \\[(Recommended|Optional)\\]  ${2:-}\$"; }
+expect_status_na()   { expect_out_fixed "      $1 ($2)"; }
 
 status_unchanged_checks() {
     expect_rc 0
+    expect_out '^  Still to do$'
     expect_out_fixed 'Nothing was changed. Run without --status to pick steps.'
     expect_no_pkg_change
     expect_no_call '^systemctl (mask|enable|restart|stop)|^curl|^df '
     expect_no_file "$R/run/fedora-kde-setup.lock"
-    expect_no_out 'Will do:'
+    expect_no_out 'Will do:|Continue with|Quit without changes'
+    check "no cursor/screen control in --status" not grep -q $'\e\\[?25l' "$T/raw.txt"
 }
 
-scenario status_fresh "live user" "--status on a fresh laptop: todo/partial/n-a badges; no changes; works without root"
+scenario status_fresh "live user" "--status on a fresh laptop: todo/partial/n-a; no changes; works without root"
 sc_status_fresh() {
     menu_machine
     local before
@@ -2545,17 +2595,18 @@ sc_status_fresh() {
     invoke --status
     status_unchanged_checks
     check "fake root and homes unchanged by --status" test "$before" == "$(tree_state "$R" "$T/home")"
-    expect_out 'Already done: 0   Partly done: 1   Not done yet: 7$'
-    expect_status_line 1 ' ' 'Faster DNF downloads'
-    expect_status_line 2 ' ' 'Full system update' '• 3 updates available'
-    expect_status_line 3 ' ' 'Media codecs and video acceleration'
-    expect_out_fixed '  4. [-] Drivers for your hardware: nothing needed: your graphics and Wi-Fi use built-in drivers'
-    expect_status_line 5 ' ' 'Remove KDE PIM \(KMail, Kontact, KOrganizer\.\.\.\)' '• currently installed'
-    expect_status_line 6 ' ' 'Remove LibreOffice' '• currently installed'
-    expect_status_line 7 '◐' "Flathub as Discover's app store" \
+    expect_out '^  ✔ Already done on this computer$'
+    expect_out '^      nothing yet$'
+    expect_status_na 'Drivers for your hardware' 'nothing needed: your graphics and Wi-Fi use built-in drivers'
+    expect_status_todo 'Faster DNF downloads'
+    expect_status_todo 'Full system update' '• 3 updates available'
+    expect_status_todo 'Media codecs and video acceleration'
+    expect_status_todo 'Remove KDE PIM \(KMail, Kontact, KOrganizer\.\.\.\)' '• currently installed'
+    expect_status_todo 'Remove LibreOffice' '• currently installed'
+    expect_status_todo "Flathub as Discover's app store" \
         "◐ partly done: missing Flathub, Fedora's duplicate Flatpak source disabled, Flathub as Discover's default"
-    expect_status_line 8 ' ' 'Firmware updates' '• not checked yet'
-    expect_status_line 9 ' ' 'SSD trim \+ smaller system logs'
+    expect_status_todo 'Firmware updates' '• not checked yet'
+    expect_status_todo 'SSD trim \+ smaller system logs'
     if [[ $MODE == user ]]; then
         expect_no_out 'Run this with sudo'
         expect_call '^dnf5 -q check-upgrade$'
@@ -2564,20 +2615,21 @@ sc_status_fresh() {
     fi
 }
 
-scenario status_configured "live" "--status on a fully set-up VM: everything [✔], firmware n/a"
+scenario status_configured "live" "--status on a fully set-up VM: everything done, firmware n/a"
 sc_status_configured() {
     fx_fully_configured
     invoke --status
     status_unchanged_checks
-    expect_out 'Already done: 8   Partly done: 0   Not done yet: 0$'
-    expect_status_line 1 '✔' 'Faster DNF downloads' '✔ already set'
-    expect_status_line 2 '✔' 'Full system update' '✔ up to date'
-    expect_status_line 3 '✔' 'Media codecs and video acceleration' '✔ installed'
-    expect_status_line 4 '✔' 'Guest tools for this virtual machine \(kvm\)' '✔ installed'
-    expect_status_line 5 '✔' 'Remove KDE PIM \(KMail, Kontact, KOrganizer\.\.\.\)' '✔ already removed'
-    expect_status_line 7 '✔' "Flathub as Discover's app store" '✔ already set up'
-    expect_out_fixed '  8. [-] Firmware updates: not available in a virtual machine'
-    expect_status_line 9 '✔' 'SSD trim \+ smaller system logs' '✔ already set up'
+    expect_status_done 'Faster DNF downloads' 'already set'
+    expect_status_done 'Full system update' 'up to date'
+    expect_status_done 'Media codecs and video acceleration' 'installed'
+    expect_status_done 'Guest tools for this virtual machine \(kvm\)' 'installed'
+    expect_status_done 'Remove KDE PIM \(KMail, Kontact, KOrganizer\.\.\.\)' 'already removed'
+    expect_status_done 'Remove LibreOffice' 'already removed'
+    expect_status_done "Flathub as Discover's app store" 'already set up'
+    expect_status_done 'SSD trim \+ smaller system logs' 'already set up'
+    expect_status_na 'Firmware updates' 'not available in a virtual machine'
+    expect_out '^      nothing: everything that applies is done$'
 }
 
 scenario status_partial "live" "--status with half-done steps: partial notes for each kind"
@@ -2597,17 +2649,16 @@ sc_status_partial() {
     printf 'firmware 2026-03-04 05:06:07\n' > "$(state_file)"
     invoke --status
     status_unchanged_checks
-    expect_out 'Already done: 1   Partly done: 6   Not done yet: 2$'
-    expect_status_line 1 '◐' 'Faster DNF downloads' '◐ partly done: some settings missing'
-    expect_status_line 2 ' ' 'Full system update' "• couldn't check for updates"
-    expect_status_line 3 '◐' 'Media codecs and video acceleration' \
+    expect_status_todo 'Faster DNF downloads' '◐ partly done: some settings missing'
+    expect_status_todo 'Full system update' "• couldn't check for updates"
+    expect_status_todo 'Media codecs and video acceleration' \
         '◐ partly done: missing ffmpeg, gstreamer1-plugins-bad-freeworld, gstreamer1-plugins-ugly and 2 more'
-    expect_status_line 4 '◐' 'Drivers: NVIDIA GeForce RTX 2060 Rev\. A' '◐ partly done: missing a reboot to load it'
-    expect_status_line 5 '◐' 'Remove leftover KDE PIM data' '◐ partly done: app removed, data still in your home folder'
-    expect_status_line 6 '✔' 'Remove LibreOffice' '✔ already removed'
-    expect_status_line 7 '◐' "Flathub as Discover's app store" '◐ partly done: missing the full \(unfiltered\) Flathub'
-    expect_status_line 8 ' ' 'Firmware updates' '• last checked 2026-03-04'
-    expect_status_line 9 '◐' 'SSD trim \+ smaller system logs' '◐ partly done: partly set up'
+    expect_status_todo 'Drivers: NVIDIA GeForce RTX 2060 Rev\. A' '◐ partly done: missing a reboot to load it'
+    expect_status_todo 'Remove leftover KDE PIM data' '◐ partly done: app removed, data still in your home folder'
+    expect_status_done 'Remove LibreOffice' 'already removed'
+    expect_status_todo "Flathub as Discover's app store" '◐ partly done: missing the full \(unfiltered\) Flathub'
+    expect_status_todo 'Firmware updates' '• last checked 2026-03-04'
+    expect_status_todo 'SSD trim \+ smaller system logs' '◐ partly done: partly set up'
 }
 
 scenario status_drivers "live" "--status drivers: not installed / module missing / not loaded (+SB) / loaded"
@@ -2615,16 +2666,16 @@ sc_status_drivers() {
     fx_gpu_nvidia "${NV_TU106[@]}"
     fx_conf FKS_SB=enabled
     invoke --status
-    expect_status_line 4 ' ' 'Drivers: NVIDIA GeForce RTX 2060 Rev\. A'
+    expect_status_todo 'Drivers: NVIDIA GeForce RTX 2060 Rev\. A'
     fx_add installed akmod-nvidia
     invoke --status
-    expect_status_line 4 '◐' 'Drivers: NVIDIA .*' '◐ partly done: missing nvidia module for the running kernel'
+    expect_status_todo 'Drivers: NVIDIA .*' '◐ partly done: missing nvidia module for the running kernel'
     fx_add modules "$FX_KERNEL nvidia"
     invoke --status
-    expect_status_line 4 '◐' 'Drivers: NVIDIA .*' '◐ partly done: missing a reboot to load it \(and Secure Boot key enrollment\)'
+    expect_status_todo 'Drivers: NVIDIA .*' '◐ partly done: missing a reboot to load it \(and Secure Boot key enrollment\)'
     mkdir -p "$R/sys/module/nvidia"
     invoke --status
-    expect_status_line 4 '✔' 'Drivers: NVIDIA .*' '✔ installed'
+    expect_status_done 'Drivers: NVIDIA GeForce RTX 2060 Rev\. A' 'installed'
 }
 
 scenario status_flathub "live" "--status flathub: disabled remote, Fedora remote still used, Discover default"
@@ -2632,15 +2683,15 @@ sc_status_flathub() {
     mkdir -p "$H/.config"; printf '[ResourcesModel]\ncurrentApplicationBackend=flatpak-backend\n' > "$H/.config/discoverrc"
     printf '[remote "fedora"]\nurl=oci\n[remote "flathub"]\nurl=x\nxa.disable=true\n' > "$R/var/lib/flatpak/repo/config"
     invoke --status
-    expect_status_line 7 '◐' "Flathub as Discover's app store" "◐ partly done: missing Flathub enabled, Fedora's duplicate Flatpak source disabled"
+    expect_status_todo "Flathub as Discover's app store" "◐ partly done: missing Flathub enabled, Fedora's duplicate Flatpak source disabled"
     # Apps installed from Fedora's remote: it may stay enabled.
     printf '[remote "fedora"]\nurl=oci\n[remote "flathub"]\nurl=x\n' > "$R/var/lib/flatpak/repo/config"
     fx_add flatpak_origins fedora
     invoke --status
-    expect_status_line 7 '✔' "Flathub as Discover's app store" '✔ already set up'
+    expect_status_done "Flathub as Discover's app store" 'already set up'
     rm -f "$H/.config/discoverrc"
     invoke --status
-    expect_status_line 7 '◐' "Flathub as Discover's app store" "◐ partly done: missing Flathub as Discover's default"
+    expect_status_todo "Flathub as Discover's app store" "◐ partly done: missing Flathub as Discover's default"
 }
 
 scenario status_container "live" "--status in a container: drivers/firmware n/a, fstrim counts as done"
@@ -2650,25 +2701,25 @@ sc_status_container() {
     printf '[Journal]\nSystemMaxUse=500M\n' > "$R/etc/systemd/journald.conf.d/00-size.conf"
     invoke --status
     status_unchanged_checks
-    expect_out_fixed '  4. [-] Drivers for your hardware: not needed in a container'
-    expect_out_fixed '  8. [-] Firmware updates: not available in a container'
-    expect_status_line 9 '✔' 'SSD trim \+ smaller system logs' '✔ already set up'
+    expect_status_na 'Drivers for your hardware' 'not needed in a container'
+    expect_status_na 'Firmware updates' 'not available in a container'
+    expect_status_done 'SSD trim \+ smaller system logs' 'already set up'
 }
 
-scenario status_after_run "live" "After --all, --status shows the done steps as [✔]"
+scenario status_after_run "live" "After --all, --status lists the steps as done"
 sc_status_after_run() {
     menu_machine
     invoke --all --yes --no-reboot
     expect_success
     invoke --status
-    expect_status_line 1 '✔' 'Faster DNF downloads' '✔ already set'
-    expect_status_line 2 '✔' 'Full system update' '✔ up to date'
-    expect_status_line 3 '✔' 'Media codecs and video acceleration' '✔ installed'
-    expect_status_line 5 '✔' 'Remove KDE PIM \(KMail, Kontact, KOrganizer\.\.\.\)' '✔ already removed'
-    expect_status_line 6 '✔' 'Remove LibreOffice' '✔ already removed'
-    expect_status_line 7 '✔' "Flathub as Discover's app store" '✔ already set up'
-    expect_status_line 8 ' ' 'Firmware updates' '• last checked 2026-01-02'
-    expect_status_line 9 '✔' 'SSD trim \+ smaller system logs' '✔ already set up'
+    expect_status_done 'Faster DNF downloads' 'already set'
+    expect_status_done 'Full system update' 'up to date'
+    expect_status_done 'Media codecs and video acceleration' 'installed'
+    expect_status_done 'Remove KDE PIM \(KMail, Kontact, KOrganizer\.\.\.\)' 'already removed'
+    expect_status_done 'Remove LibreOffice' 'already removed'
+    expect_status_done "Flathub as Discover's app store" 'already set up'
+    expect_status_done 'SSD trim \+ smaller system logs' 'already set up'
+    expect_status_todo 'Firmware updates' '• last checked 2026-01-02'
 }
 
 # --- Progress and reboot advice ----------------------------------------------------

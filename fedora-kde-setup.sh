@@ -61,9 +61,9 @@ SKIP_STEPS=()
 readonly ALL_STEPS=(dnf update codecs drivers pim libreoffice flathub firmware maintenance)
 declare -A STEP_WEIGHT=([dnf]=1 [update]=30 [codecs]=15 [drivers]=20 [pim]=5 [libreoffice]=5
                         [flathub]=5 [firmware]=10 [maintenance]=1)
-# Recommended for almost everyone, or optional (a matter of taste).
+# Recommended for almost everyone, optional (a matter of taste), or removals that delete data.
 declare -A STEP_TAG=([dnf]=recommended [update]=recommended [codecs]=recommended [drivers]=recommended
-                     [pim]=optional [libreoffice]=optional [flathub]=recommended [firmware]=recommended
+                     [pim]=remove [libreoffice]=remove [flathub]=recommended [firmware]=recommended
                      [maintenance]=optional)
 declare -A STEP_TITLE=() STEP_WHY=() STEP_NA=() STEP_STATUS=() STEP_NOTE=()
 declare -A SELECTED=() AUTO_SELECTED=() LEFTOVER_ONLY=() STATE_DATE=()
@@ -120,13 +120,12 @@ else
     C_RESET="" C_BOLD="" C_BLUE="" C_GREEN="" C_YELLOW="" C_RED="" C_DIM="" C_CYAN="" C_MAGENTA=""
 fi
 
-STEP=0
-section() { STEP=$((STEP + 1)); printf '\n%s==> [%d] %s%s\n' "$C_BOLD$C_BLUE" "$STEP" "$*" "$C_RESET"; }
+section() { printf '\n%s== %s%s\n' "$C_BOLD$C_BLUE" "$*" "$C_RESET"; }
 info()    { printf '%s  ->%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
 hint()    { printf '%s  %s%s\n' "$C_YELLOW" "$*" "$C_RESET"; }
-ok()      { printf '%s  ok%s %s\n' "$C_GREEN" "$C_RESET" "$*"; DONE+=("$*"); }
-warn()    { printf '%s  !!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; WARNINGS+=("$*"); }
-die()     { printf '%s  xx %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+ok()      { printf '%s  ✔%s %s\n' "$C_GREEN" "$C_RESET" "$*"; DONE+=("$*"); }
+warn()    { printf '%s  Warning:%s %s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$*" >&2; WARNINGS+=("$*"); }
+die()     { printf '%sError:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; exit 1; }
 # fd 3 is the terminal/log, so a command's own redirections never hide its log line.
 log_cmd() { printf '%s  $ %s%s\n' "$C_DIM" "$*" "$C_RESET" >&3; }
 
@@ -139,15 +138,18 @@ on_error() {
     if [[ $cmd == '"$@"' && -n $LAST_CMD ]]; then
         cmd=$LAST_CMD
     fi
-    printf '%s  xx Failed (exit %s) at line %s in %s: %s%s\n' \
-        "$C_RED" "$rc" "$line" "${where// / <- }" "$cmd" "$C_RESET" >&2
-    printf '     Full log: %s\n' "$LOG" >&2
+    printf 'ERROR (for bug reports): exit %s at line %s in %s: %s\n' \
+        "$rc" "$line" "${where// / <- }" "$cmd" >> "$LOG" 2>/dev/null || true
+    printf '%sError:%s this command failed (exit code %s): %s\n' "$C_RED$C_BOLD" "$C_RESET" "$rc" "$cmd" >&2
 }
 
 cleanup() {
     local rc=$?
     if (( ${MENU_ACTIVE:-0} )); then
-        printf '\e[?25h' >/dev/tty 2>/dev/null || true
+        printf '\e[?25h\e[?1049l' >/dev/tty 2>/dev/null || true
+    fi
+    if (( rc != 0 && ${RUN_STARTED:-0} && ! ${FINISHED:-0} )); then
+        print_stop_summary
     fi
     if (( PK_MASKED )); then
         systemctl unmask --runtime packagekit.service &>/dev/null || true
@@ -165,9 +167,20 @@ cleanup() {
 
 trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 trap cleanup EXIT
-trap 'die "Interrupted"' INT TERM
+trap 'on_interrupt' INT TERM
 # Keep going if an SSH session drops; dnf inherits this too.
 trap '' HUP
+
+on_interrupt() {
+    if (( ${MENU_ACTIVE:-0} )); then
+        leave_menu
+    fi
+    if (( ! ${RUN_STARTED:-0} )); then
+        printf '\nStopped. Nothing was changed.\n' >&2
+        exit 130
+    fi
+    die "Stopped by Ctrl-C"
+}
 
 # Runs a command, or only prints it under --dry-run.
 run() {
@@ -220,8 +233,16 @@ require() {
 # /dev/tty is world-readable even without a controlling terminal, so try opening it.
 have_tty() { { : </dev/tty; } 2>/dev/null; }
 
+# Throws away keys typed earlier (e.g. Enter pressed while dnf ran) before asking anything.
+flush_input() {
+    local junk
+    while IFS= read -rs -t 0.05 -n 1000 junk </dev/tty 2>/dev/null; do :; done
+    return 0
+}
+
 ask_yes_no() {  # $1 = prompt, $2 = default (y/n)
     local answer=""
+    flush_input
     printf '%s%s%s ' "$C_BOLD" "$1" "$C_RESET"
     read -r answer </dev/tty || { printf '\n'; return 1; }
     answer=${answer:-$2}
@@ -284,26 +305,35 @@ download() {  # $1 = URL, $2 = destination file
 
 usage() {
     cat <<'USAGE'
-Usage: sudo bash fedora-kde-setup.sh [options]
+Set up a freshly installed Fedora KDE Plasma (Fedora 41 or newer): shows what's already
+done on this computer and lets you pick what to do from a checklist.
 
-Post-install setup for Fedora KDE Plasma (Fedora 41 or newer). Without options it shows
-what's already done on this computer and a checklist to pick what to do.
+Examples:
+  sudo bash fedora-kde-setup.sh                      open the checklist (recommended)
+  sudo bash fedora-kde-setup.sh --status             show what's already done; change nothing
+  sudo bash fedora-kde-setup.sh --dry-run            preview every command; change nothing
+  sudo bash fedora-kde-setup.sh --all --yes          everything that applies, no questions
+                                                     (never removes apps; those need --only)
+  sudo bash fedora-kde-setup.sh --only codecs,flathub --yes
 
-Choosing steps:
-      --only LIST    run only these steps (comma-separated IDs, see --list-steps)
-      --all          run every step that applies and isn't done yet
+Steps: dnf update codecs drivers flathub firmware maintenance pim libreoffice
+       (what each one does: --list-steps)
+
+Options:
+      --only LIST    run only these steps (comma-separated)
+      --all          run every step that applies and isn't done yet, except app removals
       --skip LIST    with --all: leave these steps out
-      --list-steps   list the step IDs and what each one does
+      --list-steps   list the steps and what each one does
       --status       show what's already done; change nothing
-
-Other options:
+  -n, --dry-run      print what would be done; change nothing
   -y, --yes          don't ask questions (needs --only or --all)
-  -n, --dry-run      print what would be done without changing anything
-  -f, --force        with --only/--all: also re-run steps that are already done
+  -f, --force        with --only/--all: also redo steps that are already done
       --no-reboot    don't offer to reboot at the end
   -u, --user NAME    whose KDE PIM/LibreOffice data to clean up (default: you)
-  -h, --help         show this help
   -V, --version      show the version
+  -h, --help         show this help
+
+Docs and help: https://github.com/IamAndelib/fedora-kde-postinstall
 USAGE
 }
 
@@ -341,7 +371,7 @@ parse_args() {
             --user=*)     TARGET_USER=${1#--user=}; [[ -n $TARGET_USER ]] || die "--user needs a name" ;;
             -h|--help)    usage; exit 0 ;;
             -V|--version) echo "fedora-kde-setup $SCRIPT_VERSION"; exit 0 ;;
-            *)            usage >&2; die "Unknown option: $1" ;;
+            *)            die "Unknown option '$1'. See --help." ;;
         esac
         shift
     done
@@ -1023,6 +1053,8 @@ compute_status() {
 wants_doing() {  # $1 = step
     applicable "$1" || return 1
     [[ ${STEP_STATUS[$1]} != "done" ]] || return 1
+    # Removals delete data, so "all" and "recommended" never include them.
+    [[ ${STEP_TAG[$1]} != remove ]] || return 1
     # Deleting leftover data is never implied; it must be picked explicitly.
     (( ! ${LEFTOVER_ONLY[$1]:-0} ))
 }
@@ -1063,124 +1095,365 @@ record_step() {  # $1 = step
 
 # --- Showing and choosing steps ---------------------------------------------
 
-status_badge() {  # $1 = step
+readonly STEP_GROUPS=(recommended optional remove)
+declare -A GROUP_TITLE=([recommended]="RECOMMENDED" [optional]="OPTIONAL"
+                        [remove]="REMOVE APPS YOU DON'T USE  (deletes their data)")
+# Typical duration, shown on the review screen and step headers: "min max" minutes.
+declare -A STEP_MINUTES=([dnf]="0 1" [update]="5 30" [codecs]="2 10" [drivers]="5 15" [pim]="1 3"
+                         [libreoffice]="1 3" [flathub]="1 3" [firmware]="1 5" [maintenance]="0 1")
+declare -A STEP_SHORT=([dnf]="DNF" [update]="System update" [codecs]="Codecs" [drivers]="Drivers"
+                       [pim]="KDE PIM removed" [libreoffice]="LibreOffice removed" [flathub]="Flathub"
+                       [firmware]="Firmware" [maintenance]="SSD trim + logs")
+declare -A REMOVAL_APPS=() REMOVAL_DATA=()
+
+status_badge() {  # $1 = step; plain text
     local note=${STEP_NOTE[$1]}
     case ${STEP_STATUS[$1]} in
-        done)    printf '%s✔ %s%s' "$C_GREEN" "${note:-already done}" "$C_RESET" ;;
-        partial) printf '%s◐ partly done: %s%s' "$C_YELLOW" "$note" "$C_RESET" ;;
-        *)       if [[ -n $note ]]; then printf '%s• %s%s' "$C_CYAN" "$note" "$C_RESET"; fi ;;
+        done)    printf '✔ %s' "${note:-already done}" ;;
+        partial) printf '◐ partly done: %s' "$note" ;;
+        *)       if [[ -n $note ]]; then printf '• %s' "$note"; fi ;;
     esac
 }
 
-tag_label() {  # $1 = step
-    if [[ ${STEP_TAG[$1]} == recommended ]]; then
-        printf '%s[Recommended]%s' "$C_GREEN" "$C_RESET"
+badge_color() {  # $1 = step
+    case ${STEP_STATUS[$1]} in
+        done)    printf '%s' "$C_GREEN" ;;
+        partial) printf '%s' "$C_YELLOW" ;;
+        *)       printf '%s' "$C_CYAN" ;;
+    esac
+}
+
+time_text() {  # $1 = step; "usually 5-30 min"
+    local lo hi
+    read -r lo hi <<<"${STEP_MINUTES[$1]}"
+    if (( hi <= 1 )); then
+        printf 'under a minute'
     else
-        printf '%s[Optional]%s' "$C_MAGENTA" "$C_RESET"
+        printf 'usually %d-%d min' "$lo" "$hi"
     fi
 }
 
-# $1 = menu | status
-draw_steps() {
-    print_overview
-    if [[ $1 == status ]]; then
-        local -a items
-        local id
-        mapfile -t items < <(menu_items)
-        printf '\n  %sStill to do%s\n' "$C_BOLD" "$C_RESET"
-        if (( ${#items[@]} == 0 )); then
-            printf '      %snothing: everything that applies is done%s\n' "$C_GREEN" "$C_RESET"
-        fi
-        for id in "${items[@]}"; do
-            printf '      [ ] %s%s%s  %s  %s\n' "$C_BOLD" "${STEP_TITLE[$id]}" "$C_RESET" "$(tag_label "$id")" "$(status_badge "$id")"
-            printf '          %s%s%s\n' "$C_DIM" "${STEP_WHY[$id]}" "$C_RESET"
+pad() {  # $1 = number of spaces (none if negative)
+    if (( $1 > 0 )); then printf '%*s' "$1" ''; fi
+}
+
+trunc() {  # $1 = text, $2 = width; cuts with "…"
+    local text=$1 width=$2
+    if (( width < 1 )); then
+        return 0
+    elif (( ${#text} <= width )); then
+        printf '%s' "$text"
+    else
+        printf '%s…' "${text:0:width-1}"
+    fi
+}
+
+term_size() {  # sets TERM_ROWS and TERM_COLS
+    local size
+    size=$(stty size </dev/tty 2>/dev/null || true)
+    if [[ $size =~ ^([0-9]+)\ ([0-9]+)$ ]]; then
+        TERM_ROWS=${BASH_REMATCH[1]} TERM_COLS=${BASH_REMATCH[2]}
+    else
+        TERM_ROWS=24 TERM_COLS=80
+    fi
+    (( TERM_ROWS >= 10 )) || TERM_ROWS=10
+    (( TERM_COLS >= 40 )) || TERM_COLS=40
+}
+
+# Steps the user can still choose, grouped: recommended, optional, removals.
+menu_items() {
+    local group id
+    for group in "${STEP_GROUPS[@]}"; do
+        for id in "${ALL_STEPS[@]}"; do
+            if [[ ${STEP_TAG[$id]} == "$group" ]] && applicable "$id" && [[ ${STEP_STATUS[$id]} != "done" ]]; then
+                printf '%s\n' "$id"
+            fi
         done
-    fi
+    done
 }
 
-# Read-only part of the menu: what's done and what doesn't apply here.
-print_overview() {
-    local id done_ids=() na_ids=()
+# One-line summaries of what's done and what doesn't apply here.
+overview_lines() {  # $1 = width; prints "done|..." and "na|..." lines
+    local width=$1 id done_list="" na_list=""
     for id in "${ALL_STEPS[@]}"; do
         if ! applicable "$id"; then
-            na_ids+=("$id")
+            na_list+="${na_list:+, }${STEP_SHORT[$id]}"
         elif [[ ${STEP_STATUS[$id]} == "done" ]]; then
-            done_ids+=("$id")
+            done_list+="${done_list:+, }${STEP_SHORT[$id]}"
         fi
     done
-    printf '\n  %s✔ Already done on this computer%s\n' "$C_BOLD$C_GREEN" "$C_RESET"
-    if (( ${#done_ids[@]} == 0 )); then
-        printf '      %snothing yet%s\n' "$C_DIM" "$C_RESET"
-    fi
-    for id in "${done_ids[@]}"; do
-        printf '      %s✔%s %s %s(%s)%s\n' "$C_GREEN" "$C_RESET" "${STEP_TITLE[$id]}" "$C_DIM" "${STEP_NOTE[$id]:-done}" "$C_RESET"
-    done
-    if (( ${#na_ids[@]} )); then
-        printf '\n  %s– Not needed on this computer%s\n' "$C_BOLD$C_DIM" "$C_RESET"
-        for id in "${na_ids[@]}"; do
-            printf '      %s%s (%s)%s\n' "$C_DIM" "${STEP_TITLE[$id]}" "${STEP_NA[$id]}" "$C_RESET"
-        done
+    printf 'done|%s\n' "$(trunc "✔ Already done: ${done_list:-nothing yet}" "$width")"
+    if [[ -n $na_list ]]; then
+        printf 'na|%s\n' "$(trunc "– Not needed here: $na_list" "$width")"
     fi
 }
 
-# Steps the user can still choose: applicable and not already done.
-menu_items() {
+# Full overview, used by --status and when everything is done.
+print_overview() {
     local id
+    printf '\n  %s✔ Already done on this computer%s\n' "$C_BOLD$C_GREEN" "$C_RESET"
+    local any=0
     for id in "${ALL_STEPS[@]}"; do
-        if applicable "$id" && [[ ${STEP_STATUS[$id]} != "done" ]]; then
-            printf '%s\n' "$id"
+        if applicable "$id" && [[ ${STEP_STATUS[$id]} == "done" ]]; then
+            printf '      %s✔%s %s (%s)\n' "$C_GREEN" "$C_RESET" "${STEP_TITLE[$id]}" "${STEP_NOTE[$id]:-done}"
+            any=1
         fi
     done
+    (( any )) || printf '      nothing yet\n'
+    any=0
+    for id in "${ALL_STEPS[@]}"; do
+        if ! applicable "$id"; then
+            (( any )) || printf '\n  %s– Not needed on this computer%s\n' "$C_BOLD" "$C_RESET"
+            printf '      %s (%s)\n' "${STEP_TITLE[$id]}" "${STEP_NA[$id]}"
+            any=1
+        fi
+    done
+}
+
+draw_steps() {  # --status report
+    local -a items
+    local id group last=""
+    print_overview
+    mapfile -t items < <(menu_items)
+    printf '\n  %sStill to do%s\n' "$C_BOLD" "$C_RESET"
+    if (( ${#items[@]} == 0 )); then
+        printf '      %snothing: everything that applies is done%s\n' "$C_GREEN" "$C_RESET"
+    fi
+    for id in "${items[@]}"; do
+        group=${STEP_TAG[$id]}
+        if [[ $group != "$last" ]]; then
+            printf '    %s%s%s\n' "$C_BOLD" "${GROUP_TITLE[$group]}" "$C_RESET"
+            last=$group
+        fi
+        printf '      [ ] %s  %s%s%s\n' "${STEP_TITLE[$id]}" "$(badge_color "$id")" "$(status_badge "$id")" "$C_RESET"
+        printf '          %s\n' "${STEP_WHY[$id]}"
+    done
+}
+
+menu_row() {  # $1 = step, $2 = highlighted (0/1), $3 = width
+    local id=$1 hl=$2 width=$3 box="[ ]" title badge extra="" plain room
+    if [[ -n ${SELECTED[$id]:-} ]]; then box="[x]"; fi
+    [[ -n ${AUTO_SELECTED[$id]:-} ]] && extra="  (needed by Drivers)"
+    title=${STEP_TITLE[$id]}
+    badge=$(status_badge "$id")
+    room=$(( width - 8 ))
+    title=$(trunc "$title" "$room")
+    room=$(( room - ${#title} - 2 ))
+    badge=$(trunc "$badge$extra" "$room")
+    if (( hl )); then
+        plain="> $box $title${badge:+  $badge}"
+        printf '  \e[7m%s%s%s%s\n' "$C_BOLD" "$plain" "$(pad $(( width - 2 - ${#plain} )))" "$C_RESET"
+    else
+        if [[ $box == "[x]" ]]; then box="${C_BOLD}${C_CYAN}[x]${C_RESET}"; fi
+        printf '    %s %s%s%s%s\n' "$box" "$C_BOLD" "$title" "$C_RESET" \
+            "${badge:+  $(badge_color "$id")$badge$C_RESET}"
+    fi
 }
 
 draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
-    local cur=$1 msg=$2 i id count box pointer title row
+    local cur=$1 msg=$2 i id count width line group last="" why_all=1 total
     shift 2
-    local -a items=("$@")
+    local -a items=("$@") top=() middle=() bottom=()
+    local -A item_line=()
+    term_size
+    width=$(( TERM_COLS - 1 ))
     count=$(selected_steps | grep -c . || true)
-    printf '\e[H\e[2J'
-    printf '  %sFedora KDE setup: choose what to do%s\n' "$C_BOLD" "$C_RESET"
-    print_overview
-    printf '\n  %sSelect what to do%s   %s↑/↓ move · Enter/Space select · r recommended · a all · n none · q quit%s\n\n' \
-        "$C_BOLD$C_CYAN" "$C_RESET" "$C_DIM" "$C_RESET"
-    for i in "${!items[@]}"; do
-        id=${items[i]}
-        if [[ -n ${SELECTED[$id]:-} ]]; then box="${C_BOLD}${C_CYAN}[x]${C_RESET}"; else box="[ ]"; fi
-        pointer="  " title="${C_BOLD}${STEP_TITLE[$id]}${C_RESET}"
-        if (( i == cur )); then
-            pointer="${C_BOLD}${C_CYAN}❯${C_RESET} " title=$'\e[7m'"${C_BOLD} ${STEP_TITLE[$id]} ${C_RESET}"
-        fi
-        row="  $pointer$box $title  $(tag_label "$id")  $(status_badge "$id")"
-        if [[ -n ${AUTO_SELECTED[$id]:-} ]]; then
-            row+="  ${C_YELLOW}(needed by Drivers)${C_RESET}"
-        fi
-        printf '%s\n' "$row"
-        printf '          %s%s%s\n' "$C_DIM" "${STEP_WHY[$id]}" "$C_RESET"
-    done
-    printf '\n'
+
+    top+=("  $C_BOLD$(trunc "Fedora KDE setup: choose what to do" $((width - 2)))$C_RESET")
+    while IFS='|' read -r kind line; do
+        if [[ $kind == "done" ]]; then top+=("  $C_GREEN$line$C_RESET"); else top+=("  $line"); fi
+    done < <(overview_lines $((width - 2)))
+    top+=("")
+
+    bottom+=("")
+    local plural="s"
+    (( count == 1 )) && plural=""
     i=${#items[@]}
     if (( cur == i )); then
-        printf '  %s❯%s \e[7m%s ▶ Continue with %d selected step%s %s\n' "$C_BOLD$C_CYAN" "$C_RESET" "$C_BOLD" "$count" "$( ((count == 1)) || echo s)" "$C_RESET"
+        line="> ▶ Continue with $count selected step$plural"
+        bottom+=("  "$'\e[7m'"$C_BOLD$line$(pad $(( width - 2 - ${#line} )))$C_RESET")
     else
-        printf '      %s▶ Continue with %d selected step%s%s\n' "$C_GREEN" "$count" "$( ((count == 1)) || echo s)" "$C_RESET"
+        bottom+=("    $C_GREEN▶ Continue with $count selected step$plural$C_RESET")
     fi
     if (( cur == i + 1 )); then
-        printf '  %s❯%s \e[7m%s Quit without changes %s\n' "$C_BOLD$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+        line="> Quit without changes"
+        bottom+=("  "$'\e[7m'"$C_BOLD$line$(pad $(( width - 2 - ${#line} )))$C_RESET")
     else
-        printf '      Quit without changes\n'
+        bottom+=("    Quit without changes")
     fi
-    if [[ -n $msg ]]; then
-        printf '\n  %s%s%s\n' "$C_YELLOW" "$msg" "$C_RESET"
+    bottom+=("")
+    if (( width >= 78 )); then
+        bottom+=("  $(trunc "↑↓ move · Enter select · r recommended · a all · n none · ? help · q quit" $((width - 2)))")
+    else
+        bottom+=("  $(trunc "↑↓ move · Enter select · ? help · q quit" $((width - 2)))")
     fi
+    [[ -n $msg ]] && bottom+=("  $C_YELLOW$(trunc "$msg" $((width - 2)))$C_RESET")
+
+    # Middle: group headings and steps. Show every explanation if it all fits, otherwise
+    # only the highlighted step's.
+    for _ in 1 2; do
+        middle=() item_line=() last=""
+        for i in "${!items[@]}"; do
+            id=${items[i]}
+            group=${STEP_TAG[$id]}
+            if [[ $group != "$last" ]]; then
+                [[ -n $last ]] && middle+=("")
+                case $group in
+                    recommended) middle+=("  $C_BOLD$C_CYAN${GROUP_TITLE[$group]}$C_RESET") ;;
+                    optional)    middle+=("  $C_BOLD$C_MAGENTA${GROUP_TITLE[$group]}$C_RESET") ;;
+                    *)           middle+=("  $C_BOLD$C_RED$(trunc "${GROUP_TITLE[$group]}" $((width - 2)))$C_RESET") ;;
+                esac
+                last=$group
+            fi
+            item_line[$i]=${#middle[@]}
+            middle+=("$(menu_row "$id" $(( i == cur )) "$width")")
+            if (( why_all || i == cur )); then
+                middle+=("        $(trunc "${STEP_WHY[$id]}" $((width - 8)))")
+            fi
+        done
+        total=$(( ${#top[@]} + ${#middle[@]} + ${#bottom[@]} ))
+        if (( total <= TERM_ROWS - 1 )); then
+            break
+        fi
+        why_all=0
+    done
+
+    # Still too tall: scroll the middle part so the highlighted step stays visible.
+    local room=$(( TERM_ROWS - 1 - ${#top[@]} - ${#bottom[@]} - 2 )) start=0 focus
+    if (( ${#middle[@]} > room && room > 3 )); then
+        if (( cur < ${#items[@]} )); then focus=${item_line[$cur]}; else focus=$(( ${#middle[@]} - 1 )); fi
+        start=$(( focus - room / 2 ))
+        (( start < 0 )) && start=0
+        (( start > ${#middle[@]} - room )) && start=$(( ${#middle[@]} - room ))
+        local -a window=("${middle[@]:start:room}")
+        if (( start > 0 )); then
+            window=("  ↑ $start more line(s)" "${window[@]}")
+        else
+            window=("" "${window[@]}")
+        fi
+        if (( start + room < ${#middle[@]} )); then
+            window+=("  ↓ $(( ${#middle[@]} - start - room )) more line(s)")
+        fi
+        middle=("${window[@]}")
+    fi
+
+    printf '\e[H\e[2J'
+    printf '%s\n' "${top[@]}" "${middle[@]}" "${bottom[@]}"
+}
+
+menu_help() {
+    printf '\e[H\e[2J'
+    cat <<HELP
+  ${C_BOLD}How to use this checklist${C_RESET}
+
+  ↑ / ↓  (or k / j, Tab)   move between steps
+  Enter or Space           select or unselect the highlighted step
+  r                        select all recommended steps
+  a                        select everything except the app removals
+  n                        unselect everything
+  q, Esc or Ctrl-D         quit without changing anything
+
+  When you're ready, move to "▶ Continue" and press Enter. You'll see a summary of
+  what will happen, including any data that gets deleted, and confirm once more.
+
+  Steps that are already done, or don't apply to this computer, are listed at the
+  top and don't need anything from you.
+
+  Press any key to go back.
+HELP
+    local _key
+    IFS= read -rsn1 _key </dev/tty || true
+}
+
+MENU_ACTIVE=0
+
+leave_menu() {
+    printf '\e[?25h\e[?1049l' >/dev/tty 2>/dev/null || true
+    trap - WINCH
+    MENU_ACTIVE=0
+}
+
+choose_steps_menu() {
+    local -a items
+    mapfile -t items < <(menu_items)
+    if (( ${#items[@]} == 0 )); then
+        print_overview
+        printf '\n  %sEverything that applies to this computer is already done.%s\n' "$C_GREEN" "$C_RESET"
+        printf '  To redo a step anyway: sudo bash %s --only <step> --force   (see --list-steps)\n' "$0"
+        exit 0
+    fi
+    local cur=0 n=$(( ${#items[@]} + 2 )) key rest msg="" id rc
+    MENU_ACTIVE=1
+    # Alternate screen (like less/htop), so the menu doesn't fill the scrollback.
+    printf '\e[?1049h\e[?25l' >/dev/tty
+    trap ':' WINCH
+    while true; do
+        draw_menu "$cur" "$msg" "${items[@]}" >/dev/tty
+        msg="" rc=0
+        IFS= read -rsn1 key </dev/tty || rc=$?
+        if (( rc > 128 )); then
+            continue   # window resized: redraw
+        elif (( rc != 0 )); then
+            key=q
+        fi
+        if [[ $key == $'\e' ]]; then
+            # Arrow keys send ESC [ A; wait a little so slow connections aren't read as Esc.
+            IFS= read -rsn2 -t 0.3 rest </dev/tty || rest=""
+            key+=$rest
+        fi
+        case $key in
+            $'\e[A'|$'\eOA'|k|K)
+                cur=$(( (cur - 1 + n) % n )) ;;
+            $'\e[B'|$'\eOB'|j|J|$'\t')
+                cur=$(( (cur + 1) % n )) ;;
+            ""|" ")
+                if (( cur < ${#items[@]} )); then
+                    id=${items[cur]}
+                    if [[ -n ${AUTO_SELECTED[$id]:-} ]]; then
+                        msg="The system update is needed by the drivers step; unselect the drivers first."
+                    elif [[ -n ${SELECTED[$id]:-} ]]; then
+                        unset "SELECTED[$id]"
+                    else
+                        select_step "$id"
+                    fi
+                elif (( cur == ${#items[@]} )); then
+                    if [[ -n $(selected_steps) ]]; then
+                        break
+                    fi
+                    msg="Select at least one step first: move to it and press Enter or Space."
+                else
+                    key=q
+                fi ;;
+            a|A) for id in "${items[@]}"; do wants_doing "$id" && select_step "$id"; done ;;
+            r|R) for id in "${items[@]}"; do
+                     [[ ${STEP_TAG[$id]} == recommended ]] && wants_doing "$id" && select_step "$id"
+                 done ;;
+            n|N) SELECTED=() AUTO_SELECTED=() ;;
+            '?') menu_help ;;
+        esac
+        # q, Esc and Ctrl-D all quit.
+        if [[ $key == q || $key == Q || $key == $'\e' || $key == $'\x04' ]]; then
+            leave_menu
+            printf '\nNothing was changed.\n'
+            exit 0
+        fi
+        resolve_dependencies
+    done
+    leave_menu
 }
 
 print_step_list() {
     init_steps
-    local id
-    printf 'Steps (use the IDs with --only, --skip):\n\n'
-    for id in "${ALL_STEPS[@]}"; do
-        printf '  %-12s %s [%s]\n  %-12s %s\n\n' "$id" "${STEP_TITLE[$id]}" "${STEP_TAG[$id]^}" "" "${STEP_WHY[$id]}"
+    local id group
+    printf 'Steps (use the IDs with --only and --skip):\n'
+    for group in "${STEP_GROUPS[@]}"; do
+        printf '\n  %s\n' "${GROUP_TITLE[$group]}"
+        for id in "${ALL_STEPS[@]}"; do
+            [[ ${STEP_TAG[$id]} == "$group" ]] || continue
+            printf '    %-12s %s\n    %-12s %s\n' "$id" "${STEP_TITLE[$id]}" "" "${STEP_WHY[$id]}"
+        done
     done
+    printf '\n--all selects every step that applies and isn'"'"'t done yet, except the app removals.\n'
 }
 
 resolve_dependencies() {
@@ -1219,7 +1492,9 @@ select_from_flags() {
         for id in "${ALL_STEPS[@]}"; do
             [[ " ${SKIP_STEPS[*]} " == *" $id "* ]] && continue
             applicable "$id" || continue
-            if wants_doing "$id" || { (( FORCE )) && (( ! ${LEFTOVER_ONLY[$id]:-0} )); }; then
+            if [[ ${STEP_TAG[$id]} == remove ]]; then
+                continue   # never implied: removals delete data
+            elif wants_doing "$id" || (( FORCE )); then
                 select_step "$id"
             elif [[ ${STEP_STATUS[$id]} == "done" ]]; then
                 SKIPPED_STEPS+=("${STEP_TITLE[$id]} (already done)")
@@ -1238,74 +1513,7 @@ select_from_flags() {
     fi
 }
 
-MENU_ACTIVE=0
-
-choose_steps_menu() {
-    local -a items
-    mapfile -t items < <(menu_items)
-    if (( ${#items[@]} == 0 )); then
-        print_overview
-        printf '\n  %sEverything that applies to this computer is already done.%s\n' "$C_GREEN" "$C_RESET"
-        printf '  To redo a step anyway: sudo bash %s --only <step> --force   (see --list-steps)\n' "$0"
-        exit 0
-    fi
-    local cur=0 n=$(( ${#items[@]} + 2 )) key rest msg="" id
-    MENU_ACTIVE=1
-    printf '\e[?25l' >/dev/tty
-    while true; do
-        draw_menu "$cur" "$msg" "${items[@]}" >/dev/tty
-        msg=""
-        if ! IFS= read -rsn1 key </dev/tty; then
-            key=q
-        fi
-        if [[ $key == $'\e' ]]; then
-            IFS= read -rsn2 -t 0.1 rest </dev/tty || rest=""
-            key+=$rest
-        fi
-        case $key in
-            $'\e[A'|$'\eOA'|k|K)
-                cur=$(( (cur - 1 + n) % n )) ;;
-            $'\e[B'|$'\eOB'|j|J|$'\t')
-                cur=$(( (cur + 1) % n )) ;;
-            ""|" ")
-                if (( cur < ${#items[@]} )); then
-                    id=${items[cur]}
-                    if [[ -n ${AUTO_SELECTED[$id]:-} ]]; then
-                        msg="This step is needed by the drivers step; unselect that one first."
-                    elif [[ -n ${SELECTED[$id]:-} ]]; then
-                        unset "SELECTED[$id]"
-                    else
-                        select_step "$id"
-                    fi
-                elif (( cur == ${#items[@]} )); then
-                    if [[ -n $(selected_steps) ]]; then
-                        break
-                    fi
-                    msg="Select at least one step first: move to it and press Enter or Space."
-                else
-                    key=q
-                fi ;;
-            a|A) for id in "${items[@]}"; do wants_doing "$id" && select_step "$id"; done ;;
-            r|R) for id in "${items[@]}"; do
-                     [[ ${STEP_TAG[$id]} == recommended ]] && wants_doing "$id" && select_step "$id"
-                 done ;;
-            n|N) SELECTED=() AUTO_SELECTED=() ;;
-        esac
-        # q, Esc and Ctrl-D all quit.
-        if [[ $key == q || $key == Q || $key == $'\e' || $key == $'\x04' ]]; then
-            printf '\e[?25h' >/dev/tty
-            MENU_ACTIVE=0
-            printf '\nNothing was changed.\n'
-            exit 0
-        fi
-        resolve_dependencies
-    done
-    printf '\e[?25h\e[H\e[2J' >/dev/tty
-    MENU_ACTIVE=0
-}
-
 choose_steps() {
-    section "Choose what to do"
     if (( ${#ONLY_STEPS[@]} || SELECT_ALL )); then
         select_from_flags
     elif (( ASSUME_YES )); then
@@ -1313,7 +1521,7 @@ choose_steps() {
     elif have_tty; then
         choose_steps_menu
     elif (( DRY_RUN )); then
-        info "No terminal for the checklist: previewing every step that isn't done yet"
+        info "No terminal for the checklist: previewing every step that isn't done yet (except app removals)"
         SELECT_ALL=1
         select_from_flags
     else
@@ -1339,63 +1547,237 @@ selection_needs_network() {
     return 1
 }
 
+# --- Review screen -------------------------------------------------------------
+
+# Works out, before anything runs, what removing KDE PIM / LibreOffice would also take with
+# it and which of the user's files it deletes. Unselects a removal that can't be done safely.
+plan_removals() {
+    local kind regex label out n names=() hits=() apps=() files path size
+    local -a junk matches existing
+    local -A installed=()
+    while IFS= read -r n; do installed[$n]=1; done < <(rpm -qa --qf '%{NAME}\n' 2>/dev/null || true)
+    for kind in pim libreoffice; do
+        [[ -n ${SELECTED[$kind]:-} ]] || continue
+        if [[ $kind == pim ]]; then
+            regex=$PIM_REGEX label="KDE PIM" junk=("${PIM_JUNK[@]}")
+        else
+            regex=$OFFICE_REGEX label=LibreOffice junk=("${OFFICE_JUNK[@]}")
+        fi
+        local -a pkgs
+        mapfile -t pkgs < <(installed_matching "$regex")
+        if (( ${#pkgs[@]} )); then
+            out=$(LC_ALL=C "$DNF" remove "${pkgs[@]}" --assumeno 2>&1 || true)
+            if [[ $out != *"Transaction Summary"* && $out != *"Operation aborted"* ]]; then
+                unset "SELECTED[$kind]"
+                warn "Removing $label isn't possible right now (dnf: $(tail -n 2 <<<"$out" | tr '\n' ' ')); unselected it"
+                continue
+            fi
+            hits=() apps=()
+            mapfile -t names < <(awk 'NF >= 4 && $1 ~ /^[A-Za-z0-9][A-Za-z0-9._+-]*$/ { print $1 }' <<<"$out" | sort -u)
+            for n in "${names[@]}"; do
+                [[ -n ${installed[$n]:-} ]] || continue
+                if [[ $n =~ $PROTECTED_REGEX ]]; then
+                    hits+=("$n")
+                elif [[ ! $n =~ $PIM_REGEX && ! $n =~ $OFFICE_REGEX ]]; then
+                    files=$(rpm -ql "$n" 2>/dev/null || true)
+                    if [[ $files == *"/usr/share/applications/"*".desktop"* ]]; then
+                        apps+=("$n")
+                    fi
+                fi
+            done
+            if (( ${#hits[@]} )); then
+                unset "SELECTED[$kind]"
+                warn "Removing $label would also remove core desktop parts (${hits[*]}); unselected it"
+                continue
+            fi
+            if (( ${#apps[@]} )) && (( ASSUME_YES )); then
+                unset "SELECTED[$kind]"
+                warn "Removing $label would also remove ${apps[*]}; unselected it (--yes never removes extra apps)"
+                continue
+            fi
+            REMOVAL_APPS[$kind]=${apps[*]}
+        fi
+        existing=()
+        if [[ -n $TARGET_HOME ]]; then
+            for path in "${junk[@]}"; do
+                # shellcheck disable=SC2206
+                matches=("$TARGET_HOME"/$path)
+                for n in "${matches[@]}"; do
+                    [[ -e $n || -L $n ]] && existing+=("$n")
+                done
+            done
+        fi
+        if (( ${#existing[@]} )); then
+            size=$(du -sch -- "${existing[@]}" 2>/dev/null | tail -n1 | cut -f1 || true)
+            REMOVAL_DATA[$kind]="${#existing[@]} item(s), ${size:-?} in your home folder"
+        else
+            REMOVAL_DATA[$kind]="nothing"
+        fi
+    done
+}
+
+# True if the user has real mail or contacts that the KDE PIM removal would delete.
+has_real_pim_data() {
+    [[ -n $TARGET_HOME ]] || return 1
+    local dir
+    for dir in "$TARGET_HOME/.local/share/local-mail" "$TARGET_HOME/.local/share/contacts"; do
+        if [[ -d $dir && -n $(find "$dir" -type f -print -quit 2>/dev/null) ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 confirm_selection() {
-    local id i=0
-    printf '\n  %sWill do:%s\n' "$C_BOLD" "$C_RESET"
-    for id in $(selected_steps); do
+    local id i=0 lo hi min=0 max=0 n reboot=0 note
+    local -a ids
+    plan_removals
+    resolve_dependencies
+    mapfile -t ids < <(selected_steps)
+    if (( ${#ids[@]} == 0 )); then
+        printf '\nNothing left to do. Nothing was changed.\n'
+        exit 0
+    fi
+    for id in "${ids[@]}"; do
+        read -r lo hi <<<"${STEP_MINUTES[$id]}"
+        min=$((min + lo)) max=$((max + hi))
+        case $id in update|drivers|firmware) reboot=1 ;; esac
+    done
+    n=${#ids[@]}
+    printf '\n  %sReady to start %d step%s%s' "$C_BOLD" "$n" "$( ((n == 1)) || echo s)" "$C_RESET"
+    if (( max > 1 )); then printf ' (usually about %d-%d minutes in total)' "$((min > 0 ? min : 1))" "$max"; fi
+    printf ':\n\n'
+    for id in "${ids[@]}"; do
         i=$((i + 1))
-        printf '   %d. %s%s\n' "$i" "${STEP_TITLE[$id]}" "${AUTO_SELECTED[$id]:+  (needed by Drivers)}"
+        note=""
+        [[ -n ${AUTO_SELECTED[$id]:-} ]] && note="needed by the drivers"
+        if [[ $id == drivers ]] && (( DRIVERS_NEED_KMOD && SECURE_BOOT )); then
+            note="Secure Boot: you'll set a one-time password right after this screen"
+        fi
+        printf '   %d. %-44s %s%s%s\n' "$i" "${STEP_TITLE[$id]}" "$C_DIM" "$note" "$C_RESET"
+        if [[ $id == pim || $id == libreoffice ]]; then
+            printf '      %s! deletes: %s%s\n' "$C_RED" "${REMOVAL_DATA[$id]:-nothing}" "$C_RESET"
+            if [[ -n ${REMOVAL_APPS[$id]:-} ]]; then
+                printf '      %s! also removes these apps, which use its libraries: %s%s\n' "$C_RED" "${REMOVAL_APPS[$id]}" "$C_RESET"
+            fi
+        fi
     done
     printf '\n'
+    if (( IS_LAPTOP )); then
+        printf '  Keep the laptop plugged in until it finishes.\n'
+    fi
+    if (( reboot )); then
+        printf '  A reboot will probably be needed at the end.\n'
+    fi
     if (( DRY_RUN )); then
         info "Dry run: commands below are printed, not executed."
         return 0
     fi
     if (( ! ASSUME_YES )); then
         have_tty || die "No terminal to confirm on; re-run with --yes"
-        ask_yes_no "Proceed? [y/N]" n || die "Aborted, nothing was changed."
+        ask_yes_no "Start these $n step$( ((n == 1)) || echo s) now? [y/N]" n || { printf 'Nothing was changed.\n'; exit 0; }
+        if [[ -n ${SELECTED[pim]:-} ]] && has_real_pim_data; then
+            printf '\n  %sYou have mail or contacts in %s/.local/share that will be deleted for good.%s\n' \
+                "$C_BOLD$C_RED" "$TARGET_HOME" "$C_RESET"
+            local typed=""
+            flush_input
+            printf '  Type %sdelete%s to confirm, or press Enter to keep them: ' "$C_BOLD" "$C_RESET"
+            read -r typed </dev/tty || typed=""
+            if [[ $typed != delete ]]; then
+                unset 'SELECTED[pim]'
+                printf '  OK, KDE PIM and its data are kept.\n'
+                if [[ -z $(selected_steps) ]]; then
+                    printf 'Nothing was changed.\n'
+                    exit 0
+                fi
+            fi
+        fi
+    fi
+}
+
+# Questions that would otherwise interrupt a long run are asked before it starts.
+ask_questions_up_front() {
+    MOK_READY=-1
+    if [[ -n ${SELECTED[drivers]:-} ]] && (( DRIVERS_NEED_KMOD && SECURE_BOOT )) && [[ $VIRT == none ]]; then
+        section "Secure Boot key (before the long part)"
+        if setup_secure_boot_signing; then MOK_READY=1; else MOK_READY=0; fi
     fi
 }
 
 # --- Progress ----------------------------------------------------------------
 
-progress_line() {  # $1 = percent, $2 = text
-    local pct=$1 text=$2 width=24 fill bar="" j
+STEP_TOTAL=0 STEP_INDEX=0 CURRENT_STEP="" RUN_STARTED=0 FINISHED=0
+
+elapsed_text() {  # $1 = seconds
+    if (( $1 < 60 )); then printf '%d s' "$1"; else printf '%d min' $(( ($1 + 30) / 60 )); fi
+}
+
+progress_bar() {  # $1 = percent; prints the bar
+    local pct=$1 width=24 fill bar="" j
     fill=$(( pct * width / 100 ))
+    for (( j = 0; j < width; j++ )); do
+        if (( j < fill )); then bar+="█"; else bar+="░"; fi
+    done
+    printf '[%s] %3d%%' "$bar" "$pct"
+}
+
+step_header() {  # $1 = index, $2 = total, $3 = percent, $4 = step
+    local i=$1 n=$2 pct=$3 id=$4 text
+    text="Step $i of $n · ${STEP_TITLE[$id]} · $(time_text "$id")"
     if (( TTY_OUT )); then
-        for (( j = 0; j < width; j++ )); do
-            if (( j < fill )); then bar+="█"; else bar+="░"; fi
-        done
-        printf '\n%s%s[%s] %3d%%%s  %s%s%s\n' "$C_BOLD" "$C_GREEN" "$bar" "$pct" "$C_RESET" "$C_BOLD" "$text" "$C_RESET"
-        printf '\e]0;fedora-kde-setup %d%%\a' "$pct" >/dev/tty 2>/dev/null || true
+        printf '\n%s━━ %s ━━%s\n' "$C_BOLD$C_BLUE" "$text" "$C_RESET"
+        printf '%s%s%s\n' "$C_GREEN" "$(progress_bar "$pct")" "$C_RESET"
+        printf '\e]0;fedora-kde-setup · Step %d/%d · %d%%\a' "$i" "$n" "$pct" >/dev/tty 2>/dev/null || true
     else
-        printf '\n[%d%%] %s\n' "$pct" "$text"
+        printf '\n== %s (%d%%) ==\n' "$text" "$pct"
     fi
 }
 
 run_steps() {
     local -a ids
-    local id total=0 done_weight=0 i=0
+    local id total=0 done_weight=0 i=0 started
     mapfile -t ids < <(selected_steps)
+    STEP_TOTAL=${#ids[@]}
     for id in "${ids[@]}"; do
         total=$((total + STEP_WEIGHT[$id]))
     done
+    RUN_STARTED=1
     if selection_touches_packages; then
         prepare_packages
     fi
+    ask_questions_up_front
     for id in "${ids[@]}"; do
         i=$((i + 1))
-        progress_line $(( total ? done_weight * 100 / total : 0 )) "Step $i of ${#ids[@]}: ${STEP_TITLE[$id]}"
+        STEP_INDEX=$i CURRENT_STEP=$id
+        step_header "$i" "$STEP_TOTAL" $(( total ? done_weight * 100 / total : 0 )) "$id"
+        started=$SECONDS
         STEP_OK=1
         "step_$id"
         if (( STEP_OK )); then
             RAN_STEPS+=("${STEP_TITLE[$id]}")
             record_step "$id"
+            printf '  %s✔ Step %d of %d done%s (%s)\n' "$C_GREEN$C_BOLD" "$i" "$STEP_TOTAL" "$C_RESET" "$(elapsed_text $((SECONDS - started)))"
         else
             FAILED_STEPS+=("${STEP_TITLE[$id]}")
+            printf '  %s✘ Step %d of %d not completed%s (%s); see the warnings above\n' "$C_YELLOW$C_BOLD" "$i" "$STEP_TOTAL" "$C_RESET" "$(elapsed_text $((SECONDS - started)))"
         fi
         done_weight=$((done_weight + STEP_WEIGHT[$id]))
     done
+    CURRENT_STEP=""
+}
+
+# Printed when the script stops early (an error or Ctrl-C) after steps started.
+print_stop_summary() {
+    local title finished=""
+    printf '\n%sThe script stopped' "$C_BOLD$C_RED" >&2
+    if [[ -n $CURRENT_STEP ]]; then
+        printf ' during step %d of %d (%s)' "$STEP_INDEX" "$STEP_TOTAL" "${STEP_TITLE[$CURRENT_STEP]}" >&2
+    fi
+    printf '.%s\n' "$C_RESET" >&2
+    for title in "${RAN_STEPS[@]}"; do finished+="${finished:+, }$title"; done
+    printf '  Finished before that: %s\n' "${finished:-nothing}" >&2
+    printf '  Running the script again is safe: it shows what is done and skips it.\n' >&2
+    printf '  Details are in the log: %s\n' "$LOG" >&2
 }
 
 # ---------------------------------------------------------------------------
@@ -1828,7 +2210,9 @@ step_drivers() {
     fi
 
     if (( (want_nvidia || want_wl) && SECURE_BOOT )); then
-        if ! setup_secure_boot_signing; then
+        if (( ${MOK_READY:--1} == 1 )); then
+            :
+        elif (( ${MOK_READY:--1} == 0 )) || ! setup_secure_boot_signing; then
             warn "Secure Boot signing isn't set up, so the NVIDIA/Broadcom drivers were skipped (they couldn't load). Fix it, then run the script again and pick the drivers step."
             want_nvidia=0 want_wl=0
             STEP_OK=0
@@ -1906,18 +2290,15 @@ remove_batch() {  # $1 = label, rest = package names
         warn "Skipped removing $label: it would also remove core desktop packages (${hits[*]})"
         return 1
     fi
-    if (( ${#apps[@]} )); then
-        warn "Removing $label also removes these apps, which use its libraries: ${apps[*]}"
-        if (( DRY_RUN )); then
-            info "(dry-run) a real run asks before removing them, or skips with --yes"
-        elif (( ASSUME_YES )) || ! have_tty; then
-            warn "Skipped removing $label to keep those apps. To remove it anyway: sudo dnf remove ${pkgs[*]}"
-            return 1
-        elif ! ask_yes_no "Remove them too? [y/N]" n; then
-            warn "Skipped removing $label"
+    local kind=libreoffice app approved
+    [[ $label == "KDE PIM" ]] && kind=pim
+    approved=" ${REMOVAL_APPS[$kind]:-} "
+    for app in "${apps[@]}"; do
+        if [[ $approved != *" $app "* ]]; then
+            warn "Skipped removing $label: it would now also remove $app, which wasn't on the review screen. To remove it anyway: sudo dnf remove ${pkgs[*]}"
             return 1
         fi
-    fi
+    done
 
     if ! run "$DNF" remove -y "${pkgs[@]}"; then
         warn "Removing $label failed"
@@ -2085,11 +2466,18 @@ SystemMaxUse=500M"
 }
 
 finish() {
-    section "Done"
-    local n_run=${#RAN_STEPS[@]} n_failed=${#FAILED_STEPS[@]} item
-    progress_line 100 "Finished: $n_run of $((n_run + n_failed)) steps done"
+    local n_run=${#RAN_STEPS[@]} n_failed=${#FAILED_STEPS[@]} item verdict color
+    FINISHED=1
+    if (( n_failed == 0 )); then
+        color=$C_GREEN verdict="All $n_run step$( ((n_run == 1)) || echo s) finished."
+    else
+        color=$C_YELLOW verdict="$n_run of $((n_run + n_failed)) steps finished; $n_failed need$( ((n_failed == 1)) && echo s) attention (see below)."
+    fi
     if (( TTY_OUT )); then
+        printf '\n%s━━ %s ━━%s\n%s%s%s\n' "$C_BOLD$color" "$verdict" "$C_RESET" "$color" "$(progress_bar 100)" "$C_RESET"
         printf '\e]0;fedora-kde-setup: done\a' >/dev/tty 2>/dev/null || true
+    else
+        printf '\n== %s ==\n' "$verdict"
     fi
 
     if (( n_run )); then
@@ -2149,6 +2537,7 @@ MOK
     local reason=${REBOOT_REASONS[0]:-to enroll the Secure Boot key}
     printf '\n%sA reboot is recommended %s.%s\n' "$C_BOLD$C_YELLOW" "$reason" "$C_RESET"
     if (( OFFER_REBOOT && ! ASSUME_YES && ! IN_CONTAINER )) && have_tty; then
+        printf 'Save your work in other apps first.\n'
         if ask_yes_no "Reboot now? (recommended) [Y/n]" y; then
             systemctl reboot
         else
@@ -2170,7 +2559,7 @@ main() {
     refine_steps
     compute_status
     if (( STATUS_ONLY )); then
-        draw_steps status
+        draw_steps
         printf '\nNothing was changed. Run without --status to pick steps.\n'
         exit 0
     fi

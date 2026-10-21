@@ -66,7 +66,17 @@ else
     tail -n 40 /tmp/all.log
     fail "--all exits 0"
 fi
-check "LibreOffice step skipped as already done" grep -q 'Remove LibreOffice (already done)' /tmp/all.log
+check_not "--all never removes apps"            grep -q 'dnf5 remove -y' /tmp/all.log
+check "KDE PIM still installed after --all"    rpm -q kmail
+
+echo "==> Removing KDE PIM explicitly"
+if bash "$SCRIPT" --yes --no-reboot --only pim --user "$TEST_USER" > /tmp/pim.log 2>&1; then
+    pass "--only pim exits 0"
+else
+    tail -n 40 /tmp/pim.log
+    fail "--only pim exits 0"
+fi
+check "review screen listed the data to delete" grep -q 'deletes:' /tmp/pim.log
 check "progress reaches 100%"                  grep -q '100%' /tmp/all.log
 check "dnf.conf: fastestmirror=True"           grep -qx 'fastestmirror=True' /etc/dnf/dnf.conf
 check "dnf.conf: max_parallel_downloads=10"    grep -qx 'max_parallel_downloads=10' /etc/dnf/dnf.conf
