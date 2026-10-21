@@ -217,6 +217,15 @@ sc_intel_laptop() {
     expect_out 'Secure Boot +disabled'
     expect_out 'GPU\(s\) +Intel Corporation Alder Lake-P GT2'
     expect_call_line "$CURL_HEAD $(rf_url free 41)"
+    expect_call_line "$CURL_HEAD https://mirrors.fedoraproject.org/"
+    expect_call_line "$CURL_HEAD https://dl.flathub.org/repo/flathub.flatpakrepo"
+    local t
+    for t in "Faster DNF downloads" "Full system update" "Media codecs and video acceleration" \
+        "Remove KDE PIM (KMail, Kontact, KOrganizer...)" "Remove LibreOffice" \
+        "Flathub as Discover's app store" "Firmware updates" "SSD trim + smaller system logs"; do
+        expect_will_do "$t"
+    done
+    expect_no_will_do 'Drivers'
     expect_call '^uname -m$'
     expect_call_line "pgrep -x dnf5|dnf|rpm|dnf-automatic"
     expect_call_line "rpm -q --quiet rpm"
@@ -237,7 +246,6 @@ sc_intel_laptop() {
     expect_no_action 'mesa-va-drivers'
     expect_no_kmods
     expect_no_out 'Broadcom'
-    expect_out 'no extra driver needed'
     expect_no_action '^dnf5 mark'
     expect_no_action 'autoremove'
     expect_call "^dnf5 remove $PIM_SORTED --assumeno$"
@@ -249,7 +257,10 @@ sc_intel_laptop() {
     expect_action '^dnf5 group remove -y --no-packages libreoffice$'
     expect_action '^flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo$'
     expect_action '^flatpak remote-modify --no-filter --enable flathub$'
-    expect_action '^flatpak remote-delete --force fedora$'
+    expect_action '^flatpak remote-modify --prio=10 flathub$'
+    expect_action '^flatpak remote-modify --disable fedora$'
+    expect_no_action 'remote-delete'
+    expect_action_line "$(as_user_prefix) kwriteconfig6 --file $H/.config/discoverrc --group ResourcesModel --key currentApplicationBackend flatpak-backend"
     expect_no_install plasma-discover-flatpak
     expect_action '^fwupdmgr refresh --force$'
     expect_action '^fwupdmgr update -y --no-reboot-check --no-unreported-check$'
@@ -265,7 +276,12 @@ sc_intel_laptop() {
         expect_call '^dnf5 history list$'
         expect_order '^dnf5 history list$' '^systemctl mask'
         expect_out_fixed 'Package changes are in "sudo dnf history list" (this run: transactions after #17);'
-        expect_out 'A reboot is needed to load the updated system'
+        expect_out_fixed 'A reboot is recommended so updated system services and libraries are used.'
+        expect_grep "$H/.config/discoverrc" '^currentApplicationBackend=flatpak-backend$'
+        local id
+        for id in dnf update codecs pim libreoffice flathub firmware maintenance; do expect_recorded "$id"; done
+        expect_not_recorded drivers
+        expect_out 'Finished: 8 of 8 steps done'
         expect_out_fixed "Log: $R/var/log/fedora-kde-setup.log"
         check "root log is mode 600" test "$(stat -c %a "$R/var/log/fedora-kde-setup.log")" = 600
     fi
@@ -283,7 +299,6 @@ sc_amd_desktop() {
     expect_no_action 'rpmkeys|download '
     expect_no_call '^curl .* -fsSL '
     expect_out 'Form factor +desktop'
-    expect_out 'AMD: mesa-va-drivers-freeworld'
     expect_install mesa-va-drivers-freeworld
     expect_no_action 'swap .*mesa-va-drivers'
     expect_no_action 'vdpau'
@@ -319,7 +334,7 @@ sc_nvidia_turing() {
     fx_gpu_nvidia "${NV_TU106[@]}"
     invoke --yes --no-reboot
     expect_success
-    expect_out 'NVIDIA: akmod-nvidia \+ CUDA \+ power management \+ VA-API \(NVIDIA Corporation TU106'
+    expect_will_do 'Drivers: NVIDIA GeForce RTX 2060 Rev. A'
     expect_nvidia "$NV_CURRENT_PKGS"
     expect_no_call 'repoquery'
     expect_no_action '^kmodgenca'
@@ -328,7 +343,8 @@ sc_nvidia_turing() {
     if is_live; then
         expect_call '^systemctl cat nvidia-fallback.service$'
         expect_out "Kernel module 'nvidia' built for $FX_KERNEL"
-        expect_out 'A reboot is needed to load the new drivers'
+        expect_out 'A reboot is recommended'
+        expect_recorded drivers
     fi
 }
 
@@ -339,7 +355,7 @@ sc_nvidia_no_lspci() {
     invoke --yes --no-reboot
     expect_success
     expect_out 'GPU\(s\) +vendor 0x10de device 0x28e0'
-    expect_out 'NVIDIA: akmod-nvidia \+ CUDA'
+    expect_will_do 'Drivers: NVIDIA vendor 0x10de device 0x28e0'
     expect_nvidia "$NV_CURRENT_PKGS"
 }
 
@@ -353,7 +369,9 @@ sc_nvidia_pkg_missing() {
     expect_no_action 'kernel-devel'
     expect_no_action '^akmods'
     expect_no_action 'enable nvidia-fallback'
-    expect_no_out 'A reboot is needed to load the new drivers'
+    expect_no_out 'to load the new drivers'
+    expect_not_recorded drivers
+    expect_out 'Not completed \(see warnings\):'
 }
 
 scenario nvidia_turing_sb "dry pty" "Secure Boot on, terminal, no --yes: kmodgenca + interactive MOK import before akmod-nvidia"
@@ -368,7 +386,6 @@ sc_nvidia_turing_sb() {
     fi
     expect_success
     expect_out 'Secure Boot +enabled'
-    expect_out 'Secure Boot: create an akmods signing key'
     expect_action '^dnf5 install -y --skip-unavailable akmods kmodtool mokutil openssl$'
     expect_action '^kmodgenca -a$'
     expect_action_line "mokutil --import $(mok_cert)"
@@ -446,7 +463,7 @@ sc_nvidia_sb_pending() {
     expect_success
     expect_no_call 'mokutil --import'
     expect_out 'already queued for enrollment'
-    expect_out_fixed 'Type the one-time password you set when the key was first queued (forgot it? sudo mokutil --revoke-import, then re-run with --force)'
+    expect_out_fixed 'Type the one-time password you set when the key was first queued (forgot it? sudo mokutil --revoke-import, then run the script again and pick the drivers step)'
     expect_nvidia "$NV_CURRENT_PKGS"
 }
 
@@ -477,6 +494,7 @@ sc_nvidia_sb_import_fails() {
     expect_no_file "$R/root/fedora-kde-setup-mok-password.txt"
     expect_no_file "$R/root/.fedora-kde-setup-mok.hash"
     expect_no_out 'Secure Boot key enrollment on next boot'
+    expect_not_recorded drivers
 }
 
 scenario nvidia_sb_tty_fails "pty" "MOK import fails 3 times on a terminal: driver skipped"
@@ -511,6 +529,8 @@ sc_nvidia_sb_unsigned() {
     expect_success
     expect_call "^modinfo -k $FX_KERNEL -F signer nvidia$"
     expect_out "Kernel module 'nvidia' is built but not signed"
+    expect_not_recorded drivers
+    expect_out 'Not completed \(see warnings\):'
 }
 
 scenario optimus_laptop "dry live" "Intel + NVIDIA GA107M (3D controller) Optimus laptop"
@@ -543,7 +563,7 @@ sc_pascal_main580() {
     fx_conf FKS_NVIDIA_MAIN_VER=580.178.04
     invoke --yes --no-reboot
     expect_success
-    expect_out 'NVIDIA: driver branch that still supports this card'
+    expect_will_do 'Drivers: NVIDIA GeForce GTX 1080'
     expect_call_line 'dnf5 -q repoquery --latest-limit=1 --qf %{version}\n xorg-x11-drv-nvidia'
     if is_live; then
         expect_nvidia "$NV_CURRENT_PKGS"
@@ -603,7 +623,7 @@ sc_dual_nvidia() {
     fx_add available akmod-nvidia-580xx
     invoke --yes --no-reboot
     expect_success
-    expect_out 'NVIDIA: driver branch that still supports this card, 580xx where needed \(NVIDIA Corporation GP104'
+    expect_will_do 'Drivers: NVIDIA GeForce GTX 1080'
     expect_nvidia "$NV_580XX_PKGS"
 }
 
@@ -613,9 +633,7 @@ sc_kepler() {
     fx_conf FKS_SB=enabled
     invoke --yes --no-reboot
     expect_success
-    expect_out 'card too old for maintained drivers, keeping nouveau'
-    expect_out "is Kepler or older; RPM Fusion's 470xx driver is end-of-life"
-    expect_no_out 'Secure Boot: create'
+    expect_no_will_do 'Drivers'
     expect_no_kmods
 }
 
@@ -624,7 +642,7 @@ sc_nforce_igp() {
     fx_gpu_nvidia "${NV_MCP79[@]}" 0x030000 0000:00:10.0
     invoke --yes --no-reboot
     expect_success
-    expect_out 'card too old for maintained drivers'
+    expect_no_will_do 'Drivers'
     expect_no_kmods
 }
 
@@ -633,7 +651,7 @@ sc_broadcom_wl() {
     fx_gpu_intel; fx_wifi_broadcom 0x43a0 bcma
     invoke --yes --no-reboot
     expect_success
-    expect_out 'Broadcom Wi-Fi: broadcom-wl driver'
+    expect_will_do 'Drivers: Broadcom Wi-Fi'
     expect_install broadcom-wl
     expect_install "kernel-devel-$FX_KERNEL"
     expect_action "^akmods --force --kernels $FX_KERNEL$"
@@ -647,7 +665,7 @@ sc_broadcom_phy() {
     fx_wifi_phy 0000:02:00.0 bcma0:1
     invoke --yes --no-reboot
     expect_success
-    expect_no_out 'Broadcom Wi-Fi: broadcom-wl'
+    expect_no_will_do 'Drivers'
     expect_no_kmods
 }
 
@@ -658,7 +676,7 @@ sc_broadcom_phy_direct() {
     invoke --yes --no-reboot
     expect_success
     check "fixture: sysfs device entry is a symlink" test -L "$R/sys/bus/pci/devices/0000:02:00.0"
-    expect_no_out 'Broadcom Wi-Fi: broadcom-wl'
+    expect_no_will_do 'Drivers'
     expect_no_kmods
 }
 
@@ -667,7 +685,7 @@ sc_broadcom_brcmfmac() {
     fx_gpu_intel; fx_wifi_broadcom 0x43a3
     invoke --yes --no-reboot
     expect_success
-    expect_no_out 'Broadcom Wi-Fi: broadcom-wl'
+    expect_no_will_do 'Drivers'
     expect_no_kmods
 }
 
@@ -677,7 +695,7 @@ sc_broadcom_sb() {
     fx_conf FKS_SB=enabled
     invoke --yes --no-reboot
     expect_success
-    expect_out 'Secure Boot: create an akmods signing key'
+    expect_will_do 'Drivers: Broadcom Wi-Fi'
     expect_order '^mokutil --import' "$(pkg_re broadcom-wl)"
 }
 
@@ -688,16 +706,15 @@ vm_case() {  # VIRT EXPECTED_PKG...
     invoke --yes --no-reboot
     expect_success
     expect_out "Virtual +$1$"
-    expect_out "Virtual machine \\($1\\): install guest tools"
-    expect_no_out 'Apply firmware updates'
-    expect_no_out 'Secure Boot: create'
+    expect_will_do "Guest tools for this virtual machine ($1)"
+    expect_no_will_do 'Firmware updates'
     local pkg
     for pkg in "${@:2}"; do expect_install "$pkg"; done
     expect_no_kmods
     expect_no_action '^fwupdmgr'
     expect_no_install fwupd
-    expect_out 'Virtual machine or container, skipping firmware'
     expect_action '^systemctl mask --runtime packagekit.service$'
+    if is_live; then expect_recorded drivers; expect_not_recorded firmware; fi
 }
 
 scenario vm_kvm "dry live" "KVM guest (NVIDIA passthrough, Broadcom, SB on): guest tools only"
@@ -724,24 +741,23 @@ sc_vm_unknown() {
     fx_gpu_nvidia "${NV_TU106[@]}"
     invoke --yes --no-reboot
     expect_success
-    expect_out "No guest tools known for 'xen'"
+    expect_no_will_do 'Drivers'
+    expect_no_will_do 'Guest tools'
     expect_no_kmods
 }
 
 container_checks() {
     expect_success
     expect_out 'Virtual +container$'
-    expect_out 'Container: skip drivers, firmware and services'
-    expect_out 'Container: skipping drivers'
-    expect_no_out 'Virtual machine \('
-    expect_no_out 'Apply firmware updates with fwupd'
+    expect_no_will_do 'Drivers'
+    expect_no_will_do 'Firmware updates'
+    expect_out 'Container: skipping systemctl'
     expect_no_action '^systemctl'
-    expect_no_call '^systemctl'
+    expect_no_call '^systemctl (mask|unmask|stop|enable|restart|reboot)'
     expect_no_kmods
     expect_no_action 'guest-agent|open-vm-tools|hyperv-daemons|virtualbox-guest'
     expect_no_action '^fwupdmgr'
     expect_no_call '^pkcon'
-    expect_out 'Virtual machine or container, skipping firmware'
 }
 
 scenario container_podman "dry live" "Podman container (.containerenv, detect-virt --container)"
@@ -791,7 +807,7 @@ sc_container_pty() {
     expect_success
     expect_out 'Proceed\? \[y/N\]'
     expect_no_out 'Reboot now'
-    expect_no_call '^systemctl'
+    expect_no_call '^systemctl (mask|unmask|stop|enable|restart|reboot)'
 }
 
 scenario bios_no_mokutil "dry live" "BIOS boot: no efivars, no mokutil; NVIDIA unsigned"
