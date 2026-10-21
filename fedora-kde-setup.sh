@@ -130,6 +130,9 @@ WARNINGS=() RAN_STEPS=() SKIPPED_STEPS=() FAILED_STEPS=() REBOOT_REASONS=()
 TTY_OUT=0
 if [[ -t 1 ]]; then
     TTY_OUT=1
+fi
+# Colors only on a real terminal, and not when NO_COLOR is set (no-color.org).
+if (( TTY_OUT )) && [[ -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
     C_RESET=$'\e[0m' C_BOLD=$'\e[1m' C_BLUE=$'\e[34m' C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m' C_RED=$'\e[31m' C_DIM=$'\e[2m'
     C_CYAN=$'\e[36m' C_MAGENTA=$'\e[35m'
 else
@@ -159,6 +162,10 @@ on_error() {
     local rc=$1 line=$2 cmd=$3
     # A failing $(...) is reported once, by the shell that uses its result.
     (( BASH_SUBSHELL == 0 )) || return 0
+    # Leave the checklist screen first, or the message vanishes with it.
+    if (( ${MENU_ACTIVE:-0} )); then
+        leave_menu
+    fi
     # Drop on_error itself and bash's implicit outermost "main" frame.
     local where=${FUNCNAME[*]:1:${#FUNCNAME[@]}-2}
     if [[ $cmd == '"$@"' && -n $LAST_CMD ]]; then
@@ -172,7 +179,10 @@ on_error() {
 cleanup() {
     local rc=$?
     if (( ${MENU_ACTIVE:-0} )); then
-        printf '\e[?1006l\e[?1000l\e[?25h\e[?1049l' 2>/dev/null >/dev/tty || true
+        leave_menu
+    fi
+    if (( ${TITLE_SET:-0} )); then
+        printf '\e]0;\a' 2>/dev/null >/dev/tty || true   # give the window its own title back
     fi
     if (( rc != 0 && ${RUN_STARTED:-0} && ! ${FINISHED:-0} )); then
         print_stop_summary
@@ -260,16 +270,29 @@ require() {
 have_tty() { { : </dev/tty; } 2>/dev/null; }
 
 # Throws away keys typed earlier (e.g. Enter pressed while dnf ran) before asking anything.
+# Drops keys typed ahead (or Enter held down) so they can't answer the next question:
+# waits until nothing has been typed for 0.3 seconds.
 flush_input() {
     local junk
-    while IFS= read -rs -t 0.05 -n 1000 junk </dev/tty 2>/dev/null; do :; done
+    while IFS= read -rs -t 0.3 -n 1 junk </dev/tty 2>/dev/null; do :; done
     return 0
+}
+
+# Prints a question: to the log as usual, and also straight to the terminal when the
+# output is redirected, so the script never waits on a question nobody can see.
+ask_print() {  # printf arguments
+    # shellcheck disable=SC2059
+    printf "$@"
+    if (( ! TTY_OUT )); then
+        # shellcheck disable=SC2059
+        printf "$@" 2>/dev/null >/dev/tty || true
+    fi
 }
 
 ask_yes_no() {  # $1 = prompt, $2 = default (y/n)
     local answer=""
     flush_input
-    printf '%s%s%s ' "$C_BOLD" "$1" "$C_RESET"
+    ask_print '%s%s%s ' "$C_BOLD" "$1" "$C_RESET"
     read -r answer </dev/tty || { printf '\n'; return 1; }
     answer=${answer:-$2}
     [[ $answer =~ ^[Yy] ]]
@@ -1186,13 +1209,12 @@ trunc() {  # $1 = text, $2 = width; cuts with "…"
 term_size() {  # sets TERM_ROWS and TERM_COLS
     local size
     size=$(stty size </dev/tty 2>/dev/null || true)
-    if [[ $size =~ ^([0-9]+)\ ([0-9]+)$ ]]; then
+    TERM_SIZE=$size   # as reported, to notice a resize
+    if [[ $size =~ ^([1-9][0-9]*)\ ([1-9][0-9]*)$ ]]; then
         TERM_ROWS=${BASH_REMATCH[1]} TERM_COLS=${BASH_REMATCH[2]}
     else
-        TERM_ROWS=24 TERM_COLS=80
+        TERM_ROWS=24 TERM_COLS=80   # size unknown
     fi
-    (( TERM_ROWS >= 10 )) || TERM_ROWS=10
-    (( TERM_COLS >= 40 )) || TERM_COLS=40
 }
 
 # Steps the user can still choose, grouped: recommended, optional, removals.
@@ -1300,33 +1322,56 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
     done < <(overview_lines $((width - 2)))
     top+=("")
 
-    bottom+=("")
-    local plural="s"
+    local plural="s" b_cont b_quit b_help b_why
     (( count == 1 )) && plural=""
     i=${#items[@]}
     if (( cur == i )); then
         line="> ▶ Continue with $count selected step$plural"
-        bottom+=("  "$'\e[7m'"$C_BOLD$line$(pad $(( width - 2 - ${#line} )))$C_RESET")
+        b_cont="  "$'\e[7m'"$C_BOLD$line$(pad $(( width - 2 - ${#line} )))$C_RESET"
+        b_why="Shows a summary of what will happen; nothing changes until you confirm."
     else
-        bottom+=("    $C_GREEN▶ Continue with $count selected step$plural$C_RESET")
+        b_cont="    $C_GREEN▶ Continue with $count selected step$plural$C_RESET"
     fi
     if (( cur == i + 1 )); then
         line="> Quit without changes"
-        bottom+=("  "$'\e[7m'"$C_BOLD$line$(pad $(( width - 2 - ${#line} )))$C_RESET")
+        b_quit="  "$'\e[7m'"$C_BOLD$line$(pad $(( width - 2 - ${#line} )))$C_RESET"
+        b_why="Leaves without changing anything."
     else
-        bottom+=("    Quit without changes")
+        b_quit="    Quit without changes"
     fi
-    bottom+=("")
+    if (( cur < i )); then
+        b_why=${STEP_WHY[${items[cur]}]}
+    fi
+    b_why="  $C_DIM$(trunc "ℹ $b_why" $((width - 2)))$C_RESET"
     if (( width >= 78 )); then
-        bottom+=("  $(trunc "↑↓ move · Enter select · r recommended · a all · n none · ? help · q quit" $((width - 2)))")
+        b_help="  $(trunc "↑↓ move · Enter select · r recommended · a all · n none · ? help · q quit" $((width - 2)))"
     else
-        bottom+=("  $(trunc "↑↓ move · Enter select · ? help · q quit" $((width - 2)))")
+        b_help="  $(trunc "↑↓ move · Enter select · ? help · q quit" $((width - 2)))"
     fi
-    [[ -n $msg ]] && bottom+=("  $C_YELLOW$(trunc "$msg" $((width - 2)))$C_RESET")
+    # A message takes the place of the blank or explanation line, so the layout never
+    # changes height (and rows never move under the mouse).
+    local b_gap=""
+    if [[ -n $msg ]]; then
+        b_why="  $C_YELLOW$(trunc "$msg" $((width - 2)))$C_RESET" b_gap=$b_why
+    fi
 
-    # Middle: group headings and steps. Show every explanation if it all fits, otherwise
-    # only the highlighted step's.
-    for _ in 1 2; do
+    # Middle: group headings and steps. Show every explanation under its step if it all
+    # fits. Otherwise show only the highlighted step's, in a fixed line above Continue (so
+    # rows don't shift as the highlight moves); in a short window also drop the overview,
+    # spacing and key help. bpos = where Continue is in the bottom part.
+    local pass bpos
+    for pass in 1 2 3; do
+        case $pass in
+            1) bottom=("$b_gap" "$b_cont" "$b_quit" "" "$b_help") bpos=1 ;;
+            2) bottom=("" "$b_why" "$b_cont" "$b_quit" "" "$b_help") bpos=2 why_all=0 ;;
+            3)
+                # Scrolling the full layout is fine while a few steps still show at a time.
+                if (( TERM_ROWS - 1 - ${#top[@]} - ${#bottom[@]} - 2 >= 4 )); then
+                    break
+                fi
+                top=("${top[0]}")
+                bottom=("$b_why" "$b_cont" "$b_quit") bpos=1 ;;
+        esac
         middle=() item_line=() line_item=() last=""
         for i in "${!items[@]}"; do
             id=${items[i]}
@@ -1343,7 +1388,7 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
             item_line[$i]=${#middle[@]}
             line_item[${#middle[@]}]=$i
             middle+=("$(menu_row "$id" $(( i == cur )) "$width")")
-            if (( why_all || i == cur )); then
+            if (( why_all )); then
                 line_item[${#middle[@]}]=$i
                 middle+=("        $(trunc "${STEP_WHY[$id]}" $((width - 8)))")
             fi
@@ -1352,17 +1397,40 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
         if (( total <= TERM_ROWS - 1 )); then
             break
         fi
-        why_all=0
     done
 
     # Still too tall: scroll the middle part so the highlighted step stays visible.
     local room=$(( TERM_ROWS - 1 - ${#top[@]} - ${#bottom[@]} - 2 )) start=0 focus
     local shown=${#middle[@]} skip=0 m
-    if (( ${#middle[@]} > room && room > 3 )); then
+    MENU_ROW_ITEM=()
+    if (( (total > TERM_ROWS - 1 && room < 1) || TERM_COLS < 30 )); then
+        printf '\e[H\e[2J'
+        printf '%s\n' "Window too small." "Make it bigger, or press q to quit."
+        return 0
+    fi
+    if (( total > TERM_ROWS - 1 )); then
+        # Scroll only as far as needed to keep the highlighted step (and its explanation)
+        # in view, so the list doesn't jump around under the mouse.
+        local focus_end
         if (( cur < ${#items[@]} )); then focus=${item_line[$cur]}; else focus=$(( ${#middle[@]} - 1 )); fi
-        start=$(( focus - room / 2 ))
-        (( start < 0 )) && start=0
-        (( start > ${#middle[@]} - room )) && start=$(( ${#middle[@]} - room ))
+        focus_end=$focus
+        if [[ ${line_item[focus + 1]:-} == "${line_item[focus]:-x}" ]]; then
+            focus_end=$(( focus + 1 ))
+        fi
+        start=$MENU_START
+        if (( focus < start )); then
+            start=$focus
+            # Show the group heading above the first step of a group too.
+            if (( start > 0 )) && [[ -z ${line_item[start - 1]:-} ]]; then
+                start=$(( start - 1 ))
+            fi
+        fi
+        if (( focus_end >= start + room )); then
+            start=$(( focus_end - room + 1 ))
+        fi
+        (( start <= ${#middle[@]} - room )) || start=$(( ${#middle[@]} - room ))
+        (( start >= 0 )) || start=0
+        MENU_START=$start
         local -a window=("${middle[@]:start:room}")
         shown=$room skip=1
         if (( start > 0 )); then
@@ -1377,22 +1445,25 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
     fi
 
     # Which step each screen row shows (rows count from 1), so mouse clicks can find it.
-    MENU_ROW_ITEM=()
     for m in "${!line_item[@]}"; do
         if (( m >= start && m < start + shown )); then
             MENU_ROW_ITEM[${#top[@]} + 1 + skip + m - start]=${line_item[m]}
         fi
     done
-    MENU_ROW_ITEM[${#top[@]} + ${#middle[@]} + 2]=${#items[@]}
-    MENU_ROW_ITEM[${#top[@]} + ${#middle[@]} + 3]=$(( ${#items[@]} + 1 ))
+    MENU_ROW_ITEM[${#top[@]} + ${#middle[@]} + bpos + 1]=${#items[@]}
+    MENU_ROW_ITEM[${#top[@]} + ${#middle[@]} + bpos + 2]=$(( ${#items[@]} + 1 ))
 
     printf '\e[H\e[2J'
     printf '%s\n' "${top[@]}" "${middle[@]}" "${bottom[@]}"
 }
 
 menu_help() {
-    printf '\e[H\e[2J'
-    cat <<HELP
+    local redraw=1
+    while true; do
+        if (( redraw )); then
+            term_size
+            printf '\e[H\e[2J'
+            cat <<HELP
   ${C_BOLD}How to use this checklist${C_RESET}
 
   ↑ / ↓  (or k / j, Tab)   move between steps
@@ -1403,17 +1474,26 @@ menu_help() {
   q, Esc or Ctrl-D         quit without changing anything
   Mouse                    the wheel moves one step per notch; a click selects
                            (hold Shift to select text with the mouse)
-
-  When you're ready, move to "▶ Continue" and press Enter. You'll see a summary of
-  what will happen, including any data that gets deleted, and confirm once more.
-
-  Steps that are already done, or don't apply to this computer, are listed at the
-  top and don't need anything from you.
-
-  Press any key to go back.
 HELP
-    while read_menu_key; [[ $MENU_KEY == wheel-* || $MENU_KEY == resize || -z $MENU_KEY ]]; do
-        :
+            if (( TERM_ROWS >= 20 )); then
+                cat <<HELP
+
+  When you're ready, move to "▶ Continue" and press Enter. You'll see a
+  summary of what will happen, including any data that gets deleted, and
+  confirm once more.
+
+  Steps that are already done, or don't apply to this computer, are listed
+  at the top and don't need anything from you.
+HELP
+            fi
+            printf '\n  Press any key to go back.\n'
+        fi
+        read_menu_key
+        case $MENU_KEY in
+            resize)         redraw=1 ;;
+            wheel-*|"")     redraw=0 ;;
+            *)              break ;;
+        esac
     done
 }
 
@@ -1422,13 +1502,19 @@ HELP
 # wheel-down, "click ROW"). Anything else becomes "", so stray sequences do nothing.
 MENU_KEY=""
 read_menu_key() {
-    local c seq rc=0 b y
+    local c seq rc b y
     MENU_KEY=""
-    IFS= read -rsn1 c </dev/tty || rc=$?
-    if (( rc > 128 )); then
-        MENU_KEY=resize   # interrupted by the window-resize trap
-        return 0
-    elif (( rc != 0 )) || [[ $c == $'\x04' ]]; then
+    while true; do
+        rc=0
+        IFS= read -rsn1 -t 0.5 c </dev/tty || rc=$?
+        (( rc > 128 )) || break
+        # Nothing typed for a while: redraw if the window was resized meanwhile.
+        if [[ $(stty size </dev/tty 2>/dev/null) != "$TERM_SIZE" ]]; then
+            MENU_KEY=resize
+            return 0
+        fi
+    done
+    if (( rc != 0 )) || [[ $c == $'\x04' ]]; then
         MENU_KEY=eof
         return 0
     fi
@@ -1440,11 +1526,14 @@ read_menu_key() {
     esac
     [[ $c == $'\e' ]] || return 0
     # Escape sequence. Wait a little so slow connections aren't read as a lone Esc.
-    if ! IFS= read -rsn1 -t 0.3 c </dev/tty; then
+    if ! IFS= read -rsn1 -t 0.5 c </dev/tty; then
         MENU_KEY=esc
         return 0
     fi
-    [[ $c == "[" || $c == O ]] || return 0   # Alt+key: ignore
+    if [[ $c != "[" && $c != O ]]; then
+        MENU_KEY=esc   # Esc pressed twice, or Esc and then another key quickly
+        return 0
+    fi
     seq=$c
     # Read up to the final character (@ to ~); the length cap stops runaway input.
     while (( ${#seq} < 24 )) && IFS= read -rsn1 -t 0.3 c </dev/tty; do
@@ -1479,13 +1568,30 @@ read_menu_key() {
     return 0
 }
 
-MENU_ACTIVE=0
+MENU_ACTIVE=0 MENU_STTY="" TERM_SIZE="" TITLE_SET=0 MENU_START=0
 MENU_ROW_ITEM=()
 
+enter_menu() {
+    MENU_ACTIVE=1
+    # No echo between key reads, so keys pressed during a redraw don't show up as ^[[B.
+    MENU_STTY=$(stty -g </dev/tty 2>/dev/null || true)
+    stty -echo -icanon </dev/tty 2>/dev/null || true
+    # Alternate screen (like less/htop), so the menu doesn't fill the scrollback; hidden
+    # cursor; no line wrapping, so long lines are cut instead of pushing the screen up.
+    # Mouse reporting makes the terminal send one event per wheel notch instead of several
+    # arrow keys, so the wheel moves exactly one step.
+    printf '\e[?1049h\e[?25l\e[?7l\e[?1000h\e[?1006h' >/dev/tty
+}
+
 leave_menu() {
-    printf '\e[?1006l\e[?1000l\e[?25h\e[?1049l' 2>/dev/null >/dev/tty || true
-    trap - WINCH
+    local junk
     MENU_ACTIVE=0
+    printf '\e[?1006l\e[?1000l\e[?7h\e[?25h\e[?1049l' 2>/dev/null >/dev/tty || true
+    # Drop mouse events or keys still on their way, so they don't reach the shell.
+    while IFS= read -rs -t 0.05 -n 1 junk </dev/tty 2>/dev/null; do :; done
+    if [[ -n $MENU_STTY ]]; then
+        stty "$MENU_STTY" </dev/tty 2>/dev/null || true
+    fi
 }
 
 choose_steps_menu() {
@@ -1505,12 +1611,7 @@ choose_steps_menu() {
         fi
     done
     resolve_dependencies
-    MENU_ACTIVE=1
-    # Alternate screen (like less/htop), so the menu doesn't fill the scrollback. Mouse
-    # reporting makes the terminal send one event per wheel notch instead of several arrow
-    # keys, so the wheel moves exactly one step.
-    printf '\e[?1049h\e[?25l\e[?1000h\e[?1006h' >/dev/tty
-    trap ':' WINCH
+    enter_menu
     while true; do
         draw_menu "$cur" "$msg" "${items[@]}" >/dev/tty
         msg=""
@@ -1540,7 +1641,7 @@ choose_steps_menu() {
                      [[ ${STEP_TAG[$id]} == recommended ]] && wants_doing "$id" && select_step "$id"
                  done ;;
             n|N) SELECTED=() AUTO_SELECTED=() ;;
-            '?') menu_help ;;
+            '?') menu_help >/dev/tty ;;
         esac
         if [[ $MENU_KEY == enter ]]; then
             if (( cur < ${#items[@]} )); then
@@ -1648,8 +1749,10 @@ choose_steps() {
         select_from_flags
     elif (( ASSUME_YES )); then
         die "Choose steps with --only ... or --all (see --list-steps). Nothing was changed."
-    elif have_tty; then
+    elif have_tty && [[ ${TERM:-} != dumb ]]; then
         choose_steps_menu
+    elif have_tty && (( ! DRY_RUN )); then
+        die "This terminal (TERM=dumb) can't show the checklist. Choose steps with --only ... or --all (see --list-steps)."
     elif (( DRY_RUN )); then
         info "No terminal for the checklist: previewing every step that isn't done yet (except app removals)"
         SELECT_ALL=1
@@ -1811,7 +1914,7 @@ confirm_selection() {
                 "$C_BOLD$C_RED" "$TARGET_HOME" "$C_RESET"
             local typed=""
             flush_input
-            printf '  Type %sdelete%s to confirm, or press Enter to keep them: ' "$C_BOLD" "$C_RESET"
+            ask_print '  Type %sdelete%s to confirm, or press Enter to keep them: ' "$C_BOLD" "$C_RESET"
             read -r typed </dev/tty || typed=""
             if [[ $typed != delete ]]; then
                 unset 'SELECTED[pim]'
@@ -1858,6 +1961,7 @@ step_header() {  # $1 = index, $2 = total, $3 = percent, $4 = step
         printf '\n%s━━ %s ━━%s\n' "$C_BOLD$C_BLUE" "$text" "$C_RESET"
         printf '%s%s%s\n' "$C_GREEN" "$(progress_bar "$pct")" "$C_RESET"
         printf '\e]0;fedora-kde-setup · Step %d/%d · %d%%\a' "$i" "$n" "$pct" 2>/dev/null >/dev/tty || true
+        TITLE_SET=1
     else
         printf '\n== %s (%d%%) ==\n' "$text" "$pct"
     fi
@@ -2213,7 +2317,9 @@ setup_secure_boot_signing() {
     if have_tty && (( ! ASSUME_YES )); then
         info "Create a one-time password (8+ characters). You'll type it once more on the blue MOK screen after reboot."
         local tries=0
-        # mokutil doesn't flush its prompts, so talk to the terminal directly.
+        # mokutil doesn't flush its prompts, so talk to the terminal directly. Drop keys
+        # typed while packages installed, or they'd become (empty) passwords.
+        flush_input
         until mokutil --import "$MOK_CERT" </dev/tty >/dev/tty 2>&1; do
             tries=$((tries + 1))
             if (( tries >= 3 )); then
@@ -2221,6 +2327,7 @@ setup_secure_boot_signing() {
                 return 1
             fi
             warn "Passwords didn't match or import failed, try again"
+            flush_input
         done
     else
         # Unattended (--yes or no terminal): generate a password and save it for the user.
