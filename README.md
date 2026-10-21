@@ -43,11 +43,12 @@ You don't need to check the technical details yourself. The script checks everyt
 
 Press the **Meta/Windows key**, type **`Konsole`**, and press **Enter**.
 
-### 2. Download the script
+### 2. Download the script into its own folder
 
-Copy these two lines into Konsole and press **Enter**:
+Copy these lines into Konsole and press **Enter**. They make a folder called `fedora-kde-postinstall` in your home folder, go into it, and download the script and its checksum there:
 
 ```bash
+mkdir -p ~/fedora-kde-postinstall && cd ~/fedora-kde-postinstall
 curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.1.0/fedora-kde-setup.sh
 curl -fLO https://raw.githubusercontent.com/IamAndelib/fedora-kde-postinstall/v1.1.0/fedora-kde-setup.sh.sha256
 ```
@@ -60,7 +61,10 @@ This makes sure the file arrived complete and unmodified:
 sha256sum -c fedora-kde-setup.sh.sha256
 ```
 
-You should see `fedora-kde-setup.sh: OK`. **If you don't, stop.** Delete both files and download them again.
+You should see `fedora-kde-setup.sh: OK`. **If you don't, stop.** Delete the folder (see [Clean up](#clean-up)) and start again from step 2.
+
+> [!TIP]
+> Closed Konsole in between? Open it again and run `cd ~/fedora-kde-postinstall` first, so the next commands find the script.
 
 ### 4. Preview what it will do
 
@@ -109,6 +113,16 @@ It shows a colored checklist. Nothing is ticked at first:
 ### 6. Reboot
 
 At the end it shows a summary. If a reboot is recommended (new kernel, drivers or firmware), it asks `Reboot now? (recommended) [Y/n]`. Press **Enter** to restart.
+
+## Clean up
+
+When you're finished (after the reboot), delete the folder. The script doesn't need it anymore; it keeps nothing important there:
+
+```bash
+rm -rf ~/fedora-kde-postinstall
+```
+
+Want to run it again later? Just repeat steps 1–3; it always downloads into the same folder.
 
 ## Running it again
 

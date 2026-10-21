@@ -923,7 +923,7 @@ status_suite() {  # $1 = pim | libreoffice
     n=$(installed_matching "$regex" | grep -c . || true)
     LEFTOVER_ONLY[$kind]=0
     if (( n > 0 )); then
-        set_status "$kind" todo "installed"
+        set_status "$kind" todo "currently installed"
     elif has_user_data "${junk[@]}"; then
         LEFTOVER_ONLY[$kind]=1
         STEP_TITLE[$kind]="Remove leftover $label data"
@@ -1088,17 +1088,28 @@ draw_steps() {
             *)       n_todo=$((n_todo + 1)) ;;
         esac
     done
-    printf '\n  %sAlready done: %d%s   %sPartly done: %d%s   %sNot done yet: %d%s\n\n' \
+    printf '\n  %sAlready done: %d%s   %sPartly done: %d%s   %sNot done yet: %d%s\n' \
         "$C_GREEN" "$n_done" "$C_RESET" "$C_YELLOW" "$n_partial" "$C_RESET" "$C_CYAN" "$n_todo" "$C_RESET"
+    printf '  %s[✔]%s already done   %s[◐]%s partly done   [ ] not done yet' "$C_GREEN" "$C_RESET" "$C_YELLOW" "$C_RESET"
+    if [[ $mode == menu ]]; then
+        printf '   %s[x]%s selected' "$C_BOLD$C_CYAN" "$C_RESET"
+    fi
+    printf '\n\n'
     for i in "${!ALL_STEPS[@]}"; do
         id=${ALL_STEPS[i]}
         if ! applicable "$id"; then
             printf '  %s%d. [-] %s: %s%s\n' "$C_DIM" "$((i + 1))" "${STEP_TITLE[$id]}" "${STEP_NA[$id]}" "$C_RESET"
             continue
         fi
-        box=""
-        if [[ $mode == menu ]]; then
-            if [[ -n ${SELECTED[$id]:-} ]]; then box="${C_BOLD}${C_GREEN}[x]${C_RESET} "; else box="[ ] "; fi
+        # Picked steps show [x]; the rest show what's already in place.
+        if [[ $mode == menu && -n ${SELECTED[$id]:-} ]]; then
+            box="${C_BOLD}${C_CYAN}[x]${C_RESET} "
+        else
+            case ${STEP_STATUS[$id]} in
+                done)    box="${C_GREEN}[✔]${C_RESET} " ;;
+                partial) box="${C_YELLOW}[◐]${C_RESET} " ;;
+                *)       box="[ ] " ;;
+            esac
         fi
         extra=""
         if [[ -n ${AUTO_SELECTED[$id]:-} ]]; then
@@ -1179,9 +1190,9 @@ choose_steps_menu() {
     local -a toks
     while true; do
         draw_steps menu
-        printf '\n  %sType numbers to tick/untick%s (e.g. "1 3 5"), %sr%s = all recommended, %sa%s = everything not done yet,\n' \
+        printf '\n  %sType numbers to select/unselect%s (e.g. "1 3 5"; selecting a [✔] step redoes it), %sr%s = all recommended not done yet,\n  %sa%s = everything not done yet, ' \
             "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
-        printf '  %sn%s = none, %sEnter%s = continue, %sq%s = quit\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+        printf '%sn%s = none, %sEnter%s = continue, %sq%s = quit\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
         printf '%s> %s' "$C_BOLD" "$C_RESET"
         if ! read -r line </dev/tty; then
             die "Aborted, nothing was changed."
@@ -2041,6 +2052,11 @@ finish() {
         printf 'undo one with "sudo dnf history undo <ID>".\n'
     fi
     printf 'Run the script again any time: it shows what is already done.\n'
+    local script_dir
+    script_dir=$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || true)
+    if [[ ${script_dir##*/} == fedora-kde-postinstall ]] && (( ! DRY_RUN )); then
+        printf 'After the reboot you can delete the download folder: rm -rf %s\n' "$script_dir"
+    fi
 
     if (( MOK_PENDING )); then
         local password_hint="the one-time password you just created"

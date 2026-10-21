@@ -19,6 +19,7 @@
 #   enabled_units   units "systemctl is-enabled" reports enabled ("enable" adds to it)
 #   modules         "KERNEL MODULE" lines: kernel modules that exist (akmods adds to it)
 #   updates_done    exists once "dnf5 upgrade --refresh" ran: check-upgrade then says 0
+#   history_last    newest "dnf5 history" ID; every package-changing transaction adds 1
 #   pk_active       number of "systemctl is-active packagekit.service" calls still
 #                   answered "active"
 #   passwd          passwd(5) lines for getent / id
@@ -138,6 +139,12 @@ transaction_table() {  # packages
     printf 'After this operation, 12 MiB will be freed (install 0 B, remove 12 MiB).\nOperation aborted by the user.\n'
 }
 
+history_bump() {  # a package-changing transaction happened
+    local last=$FKS_HISTORY_LAST
+    [[ -s $state/history_last ]] && last=$(<"$state/history_last")
+    echo $(( ${last:-0} + 1 )) > "$state/history_last"
+}
+
 stub_dnf() {
     local a sub="" assumeno=0 available=0 skip=0 ops=() p
     for a in "$@"; do
@@ -177,9 +184,11 @@ stub_dnf() {
             ;;
         history)
             printf 'ID Command line                          Date and time       Action(s) Altered\n'
-            if [[ -n $FKS_HISTORY_LAST ]]; then
+            local last=$FKS_HISTORY_LAST
+            [[ -s $state/history_last ]] && last=$(<"$state/history_last")
+            if [[ -n $last ]]; then
                 local id
-                for (( id = FKS_HISTORY_LAST; id > 0 && id > FKS_HISTORY_LAST - 3; id-- )); do
+                for (( id = last; id > 0 && id > last - 3; id-- )); do
                     printf '%2d dnf5 install -y something           2026-01-01 10:00:00 Install         1\n' "$id"
                 done
             fi
@@ -209,6 +218,7 @@ stub_dnf() {
                 return 1
             fi
             for p in "${ops[@]}"; do del_line "$p" installed; done
+            history_bump
             ;;
         install)
             for p in "${ops[@]}"; do
@@ -225,14 +235,20 @@ stub_dnf() {
                 add_line "$p" installed
                 provide "$p"
             done
+            history_bump
             ;;
         swap)
             (( ${#ops[@]} >= 2 )) || return 1
             del_line "${ops[0]}" installed
             add_line "${ops[1]}" installed
+            history_bump
             ;;
         upgrade)
             if [[ " $* " == *" --refresh "* ]]; then
+                # Nothing pending: dnf changes nothing (no new history entry).
+                if (( FKS_UPDATES > 0 )) && [[ ! -e $state/updates_done ]]; then
+                    history_bump
+                fi
                 : > "$state/updates_done"
                 [[ -n $FKS_UPGRADE_KERNEL ]] && add_line "$FKS_UPGRADE_KERNEL" kernels
             fi

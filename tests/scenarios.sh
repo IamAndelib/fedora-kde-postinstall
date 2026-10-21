@@ -81,23 +81,46 @@ expect_rpmfusion() {  # RELEASE [REPOS...]  (default: free nonfree)
     expect_order '^rpmkeys --checksig' '^dnf5 install -y .*/rpmfusion-'
 }
 
+readonly STATE=fedora-kde-setup/done
+state_file() { printf '%s' "$R/var/lib/$STATE"; }
+readonly STEP_IDS_RE='(dnf|update|codecs|drivers|pim|libreoffice|flathub|firmware|maintenance)'
+
+# Finished steps are recorded as "ID DATE" lines; the summary ends with a 100% line.
 expect_success() {
     expect_rc 0
+    expect_out 'Finished: [0-9]+ of [0-9]+ steps done'
     if is_live; then
-        expect_grep "$R/var/lib/fedora-kde-setup/done" '^2026-01-02 03:04:05$'
-        expect_grep "$R/etc/systemd/journald.conf.d/00-size.conf" '^SystemMaxUse=500M$'
-        expect_count "$R/etc/dnf/dnf.conf" '^fastestmirror=True$' 1
+        check "state file has only 'ID DATE' lines" \
+            not grep -Evq "^$STEP_IDS_RE [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}$" "$(state_file)"
+        if grep -q '^dnf ' "$(state_file)" 2>/dev/null; then
+            expect_count "$R/etc/dnf/dnf.conf" '^fastestmirror=True$' 1
+        fi
+        if grep -q '^maintenance ' "$(state_file)" 2>/dev/null; then
+            expect_grep "$R/etc/systemd/journald.conf.d/00-size.conf" '^SystemMaxUse=500M$'
+        fi
     else
         expect_out 'Dry run finished; nothing was changed'
-        expect_no_file "$R/var/lib/fedora-kde-setup/done"
+        expect_no_file "$(state_file)"
     fi
+}
+
+expect_recorded()     { check "step '$1' recorded as done" grep -q "^$1 2026-01-02 03:04:05$" "$(state_file)"; }
+expect_not_recorded() { check "step '$1' not recorded" not grep -qs "^$1 2026-01-02" "$(state_file)"; }
+
+# The "Will do:" list printed before running.
+will_do() { sed -n '/^  Will do:$/,/^$/p' "$OUT"; }
+expect_will_do()    { check "Will do lists '$1'" grep -Fq -- "$1" <(will_do); }
+expect_no_will_do() { check "Will do doesn't list '$1'" not grep -Fq -- "$1" <(will_do); }
+
+expect_no_pkg_change() {
+    expect_no_call '^dnf5? ([^ ]+ )*(install|remove|upgrade|swap|config-manager|group)( |$)'
 }
 
 expect_untouched() {  # a run that must stop before changing anything
     expect_rc nonzero
-    expect_no_dnf
-    expect_no_call '^systemctl (mask|stop)'
-    check "completion marker not written" not grep -qs '^2026-01-02 03:04:05$' "$R/var/lib/fedora-kde-setup/done"
+    expect_no_pkg_change
+    expect_no_call '^systemctl (mask|stop|enable|restart)'
+    check "no step recorded" not grep -qs '2026-01-02 03:04:05' "$(state_file)"
     expect_count "$R/etc/dnf/dnf.conf" 'fastestmirror' 0
     expect_file "$H/.config/kmail2rc"
 }
@@ -127,11 +150,14 @@ expect_kept() {  # HOME REL_PATH...
     done
 }
 
-expect_rm_count() {  # HOME N: exactly N deletions under HOME, and the summary says so
+expect_rm_count() {  # HOME N: exactly N deletions under HOME
     local n
     n=$(grep -cF -- "rm -rf -- $1/" "$T/actions")
     check "exactly $2 deletions under the home (found $n)" test "$n" -eq "$2"
-    expect_out_fixed "Removed $2 PIM/LibreOffice data and config entries from $1"
+}
+
+expect_suite_deleted() {  # HOME LABEL N: the step's summary line
+    expect_out_fixed "Deleted $3 $2 data and settings entries from $1"
 }
 
 expect_home_cleaned() {  # HOME
@@ -139,13 +165,20 @@ expect_home_cleaned() {  # HOME
     expect_kept "$1" "${FX_DECOYS[@]}"
     expect_file "$T/outside/lo-profile/registrymodifications.xcu"
     expect_rm_count "$1" "${#FX_JUNK[@]}"
+    expect_suite_deleted "$1" "KDE PIM" "${#FX_PIM_JUNK[@]}"
+    expect_suite_deleted "$1" LibreOffice "${#FX_OFFICE_JUNK[@]}"
 }
 
-expect_pim_data_kept() {  # PIM batch skipped, LibreOffice removed
+expect_pim_data_kept() {  # PIM step skipped, LibreOffice removed
     expect_kept "$H" "${FX_PIM_JUNK[@]}"
     expect_deleted "$H" "${FX_OFFICE_JUNK[@]}"
     expect_rm_count "$H" "${#FX_OFFICE_JUNK[@]}"
     expect_out_fixed "Kept KDE PIM data in $H because KDE PIM is still installed"
+    expect_suite_deleted "$H" LibreOffice "${#FX_OFFICE_JUNK[@]}"
+    if is_live; then
+        expect_not_recorded pim
+        expect_out 'Not completed \(see warnings\):'
+    fi
 }
 
 expect_home_intact() {  # HOME
