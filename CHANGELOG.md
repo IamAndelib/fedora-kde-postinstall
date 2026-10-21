@@ -19,7 +19,7 @@
 - **KDE PIM and LibreOffice:** removing each one is a separate, optional step.
 - **Flathub:** Flathub becomes Discover's default source with the highest priority. Fedora's duplicate Flatpak sources are disabled instead of deleted, and kept at lower priority if apps are installed from them.
 - **Checklist menu:**
-  - Arrow keys and Enter/Space to select.
+  - Arrow keys and Enter/Space to select; the mouse works too (one step per wheel notch, click to select).
   - Already-done and not-needed steps are shown separately at the top.
   - Steps are grouped into Recommended, Optional and Remove apps.
   - Fits any terminal size (scrolls on small windows) and uses the alternate screen.

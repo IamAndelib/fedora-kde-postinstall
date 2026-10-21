@@ -78,7 +78,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/IamAndelib/fedora-kde-postin
 
 **Then:**
 
-1. **Happy with the selection?** Press **↓** until **▶ Continue** is highlighted, then press **Enter**. To change something, move to a step with the arrow keys and press **Enter** to select or unselect it. The removals are never selected for you.
+1. **Happy with the selection?** Press **↓** until **▶ Continue** is highlighted, then press **Enter**. To change something, move to a step with the arrow keys and press **Enter** to select or unselect it (or just click it; the mouse wheel moves one step at a time). The removals are never selected for you.
 2. **Check the summary.** It shows every step, roughly how long it takes, and exactly what any removal deletes. Type **`y`** and press **Enter**.
 3. **Answer any last question** (only NVIDIA/Broadcom with Secure Boot asks for a one-time password), then **let it run**. Each step shows `Step 2 of 5` with a progress bar. A full run takes about 15–60 minutes.
 4. **Reboot when it asks** (`Reboot now? (recommended) [Y/n]`, press **Enter**).

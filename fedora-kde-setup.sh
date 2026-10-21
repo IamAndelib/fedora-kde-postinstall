@@ -146,7 +146,7 @@ on_error() {
 cleanup() {
     local rc=$?
     if (( ${MENU_ACTIVE:-0} )); then
-        printf '\e[?25h\e[?1049l' >/dev/tty 2>/dev/null || true
+        printf '\e[?1006l\e[?1000l\e[?25h\e[?1049l' >/dev/tty 2>/dev/null || true
     fi
     if (( rc != 0 && ${RUN_STARTED:-0} && ! ${FINISHED:-0} )); then
         print_stop_summary
@@ -1255,7 +1255,7 @@ menu_row() {  # $1 = step, $2 = highlighted (0/1), $3 = width
 draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
     local cur=$1 msg=$2 i id count width line group last="" why_all=1 total
     shift 2
-    local -a items=("$@") top=() middle=() bottom=()
+    local -a items=("$@") top=() middle=() bottom=() line_item=()
     local -A item_line=()
     term_size
     width=$(( TERM_COLS - 1 ))
@@ -1294,7 +1294,7 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
     # Middle: group headings and steps. Show every explanation if it all fits, otherwise
     # only the highlighted step's.
     for _ in 1 2; do
-        middle=() item_line=() last=""
+        middle=() item_line=() line_item=() last=""
         for i in "${!items[@]}"; do
             id=${items[i]}
             group=${STEP_TAG[$id]}
@@ -1308,8 +1308,10 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
                 last=$group
             fi
             item_line[$i]=${#middle[@]}
+            line_item[${#middle[@]}]=$i
             middle+=("$(menu_row "$id" $(( i == cur )) "$width")")
             if (( why_all || i == cur )); then
+                line_item[${#middle[@]}]=$i
                 middle+=("        $(trunc "${STEP_WHY[$id]}" $((width - 8)))")
             fi
         done
@@ -1322,12 +1324,14 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
 
     # Still too tall: scroll the middle part so the highlighted step stays visible.
     local room=$(( TERM_ROWS - 1 - ${#top[@]} - ${#bottom[@]} - 2 )) start=0 focus
+    local shown=${#middle[@]} skip=0 m
     if (( ${#middle[@]} > room && room > 3 )); then
         if (( cur < ${#items[@]} )); then focus=${item_line[$cur]}; else focus=$(( ${#middle[@]} - 1 )); fi
         start=$(( focus - room / 2 ))
         (( start < 0 )) && start=0
         (( start > ${#middle[@]} - room )) && start=$(( ${#middle[@]} - room ))
         local -a window=("${middle[@]:start:room}")
+        shown=$room skip=1
         if (( start > 0 )); then
             window=("  ↑ $start more line(s)" "${window[@]}")
         else
@@ -1338,6 +1342,16 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
         fi
         middle=("${window[@]}")
     fi
+
+    # Which step each screen row shows (rows count from 1), so mouse clicks can find it.
+    MENU_ROW_ITEM=()
+    for m in "${!line_item[@]}"; do
+        if (( m >= start && m < start + shown )); then
+            MENU_ROW_ITEM[${#top[@]} + 1 + skip + m - start]=${line_item[m]}
+        fi
+    done
+    MENU_ROW_ITEM[${#top[@]} + ${#middle[@]} + 2]=${#items[@]}
+    MENU_ROW_ITEM[${#top[@]} + ${#middle[@]} + 3]=$(( ${#items[@]} + 1 ))
 
     printf '\e[H\e[2J'
     printf '%s\n' "${top[@]}" "${middle[@]}" "${bottom[@]}"
@@ -1354,6 +1368,8 @@ menu_help() {
   a                        select everything except the app removals
   n                        unselect everything
   q, Esc or Ctrl-D         quit without changing anything
+  Mouse                    the wheel moves one step per notch; a click selects
+                           (hold Shift to select text with the mouse)
 
   When you're ready, move to "▶ Continue" and press Enter. You'll see a summary of
   what will happen, including any data that gets deleted, and confirm once more.
@@ -1363,14 +1379,78 @@ menu_help() {
 
   Press any key to go back.
 HELP
-    local _key
-    IFS= read -rsn1 _key </dev/tty || true
+    while read_menu_key; [[ $MENU_KEY == wheel-* || $MENU_KEY == resize || -z $MENU_KEY ]]; do
+        :
+    done
+}
+
+# Reads one key press from the terminal into MENU_KEY: a character, or a name for special
+# keys (enter, up, down, home, end, esc, eof, resize) and mouse events (wheel-up,
+# wheel-down, "click ROW"). Anything else becomes "", so stray sequences do nothing.
+MENU_KEY=""
+read_menu_key() {
+    local c seq rc=0 b y
+    MENU_KEY=""
+    IFS= read -rsn1 c </dev/tty || rc=$?
+    if (( rc > 128 )); then
+        MENU_KEY=resize   # interrupted by the window-resize trap
+        return 0
+    elif (( rc != 0 )) || [[ $c == $'\x04' ]]; then
+        MENU_KEY=eof
+        return 0
+    fi
+    case $c in
+        ""|" ") MENU_KEY=enter ;;
+        $'\t') MENU_KEY=down ;;
+        $'\e') ;;
+        *) MENU_KEY=$c ;;
+    esac
+    [[ $c == $'\e' ]] || return 0
+    # Escape sequence. Wait a little so slow connections aren't read as a lone Esc.
+    if ! IFS= read -rsn1 -t 0.3 c </dev/tty; then
+        MENU_KEY=esc
+        return 0
+    fi
+    [[ $c == "[" || $c == O ]] || return 0   # Alt+key: ignore
+    seq=$c
+    # Read up to the final character (@ to ~); the length cap stops runaway input.
+    while (( ${#seq} < 24 )) && IFS= read -rsn1 -t 0.3 c </dev/tty; do
+        seq+=$c
+        [[ ${#seq} -gt 1 && $c == [@-~] ]] && break
+    done
+    case $seq in
+        '[A'|OA|'[1;'[0-9]A) MENU_KEY=up ;;
+        '[B'|OB|'[1;'[0-9]B) MENU_KEY=down ;;
+        '[H'|OH|'[1~'|'[7~'|'[5~') MENU_KEY=home ;;
+        '[F'|OF|'[4~'|'[8~'|'[6~') MENU_KEY=end ;;
+        '[<'*M)
+            # SGR mouse press: ESC [ < button ; column ; row M
+            seq=${seq:2:${#seq}-3}
+            b=${seq%%;*} y=${seq##*;}
+            [[ $b =~ ^[0-9]{1,3}$ && $y =~ ^[0-9]{1,4}$ ]] || return 0
+            case $(( 10#$b & ~28 )) in   # drop the Shift/Alt/Ctrl bits
+                64) MENU_KEY=wheel-up ;;
+                65) MENU_KEY=wheel-down ;;
+                0)  MENU_KEY="click $(( 10#$y ))" ;;
+            esac ;;
+        '[M')
+            # Old-style mouse report from terminals without SGR mode: three raw bytes.
+            # Read them so they aren't taken as key presses.
+            IFS= read -rsn3 -t 0.3 c </dev/tty || return 0
+            printf -v b '%d' "'${c:0:1}"
+            case $(( (b - 32) & ~28 )) in
+                64) MENU_KEY=wheel-up ;;
+                65) MENU_KEY=wheel-down ;;
+            esac ;;
+    esac
+    return 0
 }
 
 MENU_ACTIVE=0
+MENU_ROW_ITEM=()
 
 leave_menu() {
-    printf '\e[?25h\e[?1049l' >/dev/tty 2>/dev/null || true
+    printf '\e[?1006l\e[?1000l\e[?25h\e[?1049l' >/dev/tty 2>/dev/null || true
     trap - WINCH
     MENU_ACTIVE=0
 }
@@ -1384,7 +1464,7 @@ choose_steps_menu() {
         printf '  To redo a step anyway, run the setup again with: --only <step> --force   (see --list-steps)\n'
         exit 0
     fi
-    local cur=0 n=$(( ${#items[@]} + 2 )) key rest msg="" id rc
+    local cur=0 n=$(( ${#items[@]} + 2 )) msg="" id row
     # Smart default: everything recommended that isn't done yet starts selected.
     for id in "${items[@]}"; do
         if [[ ${STEP_TAG[$id]} == recommended ]] && wants_doing "$id"; then
@@ -1393,45 +1473,34 @@ choose_steps_menu() {
     done
     resolve_dependencies
     MENU_ACTIVE=1
-    # Alternate screen (like less/htop), so the menu doesn't fill the scrollback.
-    printf '\e[?1049h\e[?25l' >/dev/tty
+    # Alternate screen (like less/htop), so the menu doesn't fill the scrollback. Mouse
+    # reporting makes the terminal send one event per wheel notch instead of several arrow
+    # keys, so the wheel moves exactly one step.
+    printf '\e[?1049h\e[?25l\e[?1000h\e[?1006h' >/dev/tty
     trap ':' WINCH
     while true; do
         draw_menu "$cur" "$msg" "${items[@]}" >/dev/tty
-        msg="" rc=0
-        IFS= read -rsn1 key </dev/tty || rc=$?
-        if (( rc > 128 )); then
-            continue   # window resized: redraw
-        elif (( rc != 0 )); then
-            key=q
-        fi
-        if [[ $key == $'\e' ]]; then
-            # Arrow keys send ESC [ A; wait a little so slow connections aren't read as Esc.
-            IFS= read -rsn2 -t 0.3 rest </dev/tty || rest=""
-            key+=$rest
-        fi
-        case $key in
-            $'\e[A'|$'\eOA'|k|K)
+        msg=""
+        read_menu_key
+        case $MENU_KEY in
+            up|k|K)
                 cur=$(( (cur - 1 + n) % n )) ;;
-            $'\e[B'|$'\eOB'|j|J|$'\t')
+            down|j|J)
                 cur=$(( (cur + 1) % n )) ;;
-            ""|" ")
-                if (( cur < ${#items[@]} )); then
-                    id=${items[cur]}
-                    if [[ -n ${AUTO_SELECTED[$id]:-} ]]; then
-                        msg="The system update is needed by the drivers step; unselect the drivers first."
-                    elif [[ -n ${SELECTED[$id]:-} ]]; then
-                        unset "SELECTED[$id]"
-                    else
-                        select_step "$id"
-                    fi
-                elif (( cur == ${#items[@]} )); then
-                    if [[ -n $(selected_steps) ]]; then
-                        break
-                    fi
-                    msg="Select at least one step first: move to it and press Enter or Space."
-                else
-                    key=q
+            # The wheel stops at the ends instead of wrapping around.
+            wheel-up)
+                (( cur > 0 )) && cur=$(( cur - 1 )) ;;
+            wheel-down)
+                (( cur < n - 1 )) && cur=$(( cur + 1 )) ;;
+            home)
+                cur=0 ;;
+            end)
+                cur=${#items[@]} ;;
+            "click "*)
+                row=${MENU_KEY#click }
+                if [[ -n ${MENU_ROW_ITEM[row]:-} ]]; then
+                    cur=${MENU_ROW_ITEM[row]}
+                    MENU_KEY=enter
                 fi ;;
             a|A) for id in "${items[@]}"; do wants_doing "$id" && select_step "$id"; done ;;
             r|R) for id in "${items[@]}"; do
@@ -1440,8 +1509,27 @@ choose_steps_menu() {
             n|N) SELECTED=() AUTO_SELECTED=() ;;
             '?') menu_help ;;
         esac
+        if [[ $MENU_KEY == enter ]]; then
+            if (( cur < ${#items[@]} )); then
+                id=${items[cur]}
+                if [[ -n ${AUTO_SELECTED[$id]:-} ]]; then
+                    msg="The system update is needed by the drivers step; unselect the drivers first."
+                elif [[ -n ${SELECTED[$id]:-} ]]; then
+                    unset "SELECTED[$id]"
+                else
+                    select_step "$id"
+                fi
+            elif (( cur == ${#items[@]} )); then
+                if [[ -n $(selected_steps) ]]; then
+                    break
+                fi
+                msg="Select at least one step first: move to it and press Enter or Space."
+            else
+                MENU_KEY=q
+            fi
+        fi
         # q, Esc and Ctrl-D all quit.
-        if [[ $key == q || $key == Q || $key == $'\e' || $key == $'\x04' ]]; then
+        if [[ $MENU_KEY == q || $MENU_KEY == Q || $MENU_KEY == esc || $MENU_KEY == eof ]]; then
             leave_menu
             printf '\nNothing was changed.\n'
             exit 0
