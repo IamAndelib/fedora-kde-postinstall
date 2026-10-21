@@ -46,3 +46,18 @@ jobs:
           name: fedora-${{ matrix.release }}-log
           path: /var/log/fedora-kde-setup.log
           if-no-files-found: ignore
+
+  upgrade:
+    name: Upgrade from v1.1.0 on Fedora ${{ matrix.release }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["43", "44"]
+    container:
+      image: registry.fedoraproject.org/fedora:${{ matrix.release }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run v1.1.0, then this version, and check the result
+        run: bash tests/upgrade-from-v1.1.sh ./fedora-kde-setup.sh

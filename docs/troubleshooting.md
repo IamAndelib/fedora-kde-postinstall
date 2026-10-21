@@ -63,7 +63,7 @@ Every package change is recorded by DNF. The summary at the end of the run tells
 | RPM Fusion | Remove the packages you installed from it, then `sudo dnf remove rpmfusion-free-release rpmfusion-nonfree-release` |
 | DNF settings | Edit `/etc/dnf/dnf.conf` |
 | Journal size cap | `sudo rm /etc/systemd/journald.conf.d/00-size.conf && sudo systemctl restart systemd-journald` |
-| Fedora's Flatpak source | `sudo flatpak remote-modify --enable fedora` |
+| Fedora's Flatpak source | `sudo flatpak remote-modify --enable fedora`. If v1.1 or older removed it instead: `sudo flatpak remote-add --if-not-exists fedora oci+https://registry.fedoraproject.org` |
 | Flathub as Discover's default | Discover → Settings → pick another source and click "Make default" |
 | A Secure Boot key | `sudo mokutil --revoke-import` (before enrolling) or `sudo mokutil --delete /etc/pki/akmods/certs/public_key.der` (after) |
 
@@ -77,6 +77,9 @@ Yes. Removing them are optional steps; just don't tick them.
 
 **What is RPM Fusion, and is it safe?**
 It's the long-standing community repository for software Fedora can't include, such as full ffmpeg, patented codecs and the NVIDIA driver. Fedora's own documentation points to it. The script checks its signatures before installing it.
+
+**I used an older version (v1.1 or earlier). What happens if I run the new one?**
+It works on top of it. Everything the old version already did shows as ✔ done and isn't redone; nothing is removed or deleted again. Only what's new is offered, for example making Flathub Discover's default. The old version's "completed" marker is converted automatically.
 
 **Is it safe to run twice?**
 Yes, as often as you like. It shows what's already done, keeps your own settings, and only does what you tick. `--status` shows the overview without changing anything.
