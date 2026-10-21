@@ -2768,7 +2768,7 @@ finish() {
     fi
     printf 'Run the script again any time: it shows what is already done.\n'
     local script_dir
-    script_dir=$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || true)
+    script_dir=$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || script_dir=""
     if [[ ${script_dir##*/} == fedora-kde-postinstall ]] && (( ! DRY_RUN )); then
         printf 'After the reboot you can delete the download folder: rm -rf %s\n' "$script_dir"
     fi

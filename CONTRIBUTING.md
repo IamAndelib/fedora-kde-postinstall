@@ -23,7 +23,7 @@ bash tests/run.sh -v 'nvidia*'    # run matching scenarios, showing script outpu
 podman run --rm -v "$PWD:/src:Z" -w /src registry.fedoraproject.org/fedora:44 bash tests/fedora-integration.sh
 ```
 
-**`tests/run.sh`** runs the script against stubbed system commands and a fake `/sys`, across 144 hardware and setup scenarios (215 runs):
+**`tests/run.sh`** runs the script against stubbed system commands and a fake `/sys`, across 231 hardware, setup and terminal scenarios (308 runs):
 - **Hardware:** every NVIDIA generation, hybrid laptops, Secure Boot states, BIOS boot, Broadcom chips, VMs, containers.
 - **Environment:** no terminal, PackageKit busy, low disk, battery.
 - **Failure handling:** bad signatures, removal guards, re-runs, interrupted runs.
