@@ -122,7 +122,7 @@ MOK_PENDING=0 MOK_PREVIOUS=0 MOK_GENERATED_PASSWORD=""
 NVIDIA_INSTALLED=0 WL_INSTALLED=0 PK_MASKED=0 LOG_PID="" DELETED_COUNT=0 LAST_CMD=""
 HISTORY_START="" WORK_DIR=""
 DRIVERS_NEED_KMOD=0 DRIVERS_WANT_NVIDIA=0 STEP_OK=1
-DONE=() WARNINGS=() RAN_STEPS=() SKIPPED_STEPS=() FAILED_STEPS=() REBOOT_REASONS=()
+WARNINGS=() RAN_STEPS=() SKIPPED_STEPS=() FAILED_STEPS=() REBOOT_REASONS=()
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -139,12 +139,19 @@ fi
 section() { printf '\n%s== %s%s\n' "$C_BOLD$C_BLUE" "$*" "$C_RESET"; }
 info()    { printf '%s  ->%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
 hint()    { printf '%s  %s%s\n' "$C_YELLOW" "$*" "$C_RESET"; }
-ok()      { printf '%s  ✔%s %s\n' "$C_GREEN" "$C_RESET" "$*"; DONE+=("$*"); }
+ok()      { printf '%s  ✔%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 # Messages can include file names from the user's home: show control characters as "?" so
 # a crafted name can't send escape sequences to the terminal.
 printable() { local s=$*; printf '%s' "${s//[[:cntrl:]]/?}"; }
 warn()    { local m; m=$(printable "$*"); printf '%s  Warning:%s %s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$m" >&2; WARNINGS+=("$m"); }
 die()     { printf '%sError:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; exit 1; }
+add_reboot_reason() {
+    local reason
+    for reason in "${REBOOT_REASONS[@]}"; do
+        [[ $reason == "$1" ]] && return 0
+    done
+    REBOOT_REASONS+=("$1")
+}
 # fd 3 is the terminal/log, so a command's own redirections never hide its log line.
 log_cmd() { printf '%s  $ %s%s\n' "$C_DIM" "$(printable "$*")" "$C_RESET" >&3; }
 
@@ -165,7 +172,7 @@ on_error() {
 cleanup() {
     local rc=$?
     if (( ${MENU_ACTIVE:-0} )); then
-        printf '\e[?1006l\e[?1000l\e[?25h\e[?1049l' >/dev/tty 2>/dev/null || true
+        printf '\e[?1006l\e[?1000l\e[?25h\e[?1049l' 2>/dev/null >/dev/tty || true
     fi
     if (( rc != 0 && ${RUN_STARTED:-0} && ! ${FINISHED:-0} )); then
         print_stop_summary
@@ -456,6 +463,8 @@ resolve_target_user() {
     fi
     if [[ $TARGET_USER == root ]]; then
         require "Refusing to clean root's home. Run it with sudo from your own account, or pass --user NAME."
+        TARGET_USER="" TARGET_HOME=""   # dry run: carry on without a user
+        return 0
     fi
     # Same character set Fedora's installer allows; never all digits, "." or "..".
     if [[ ! $TARGET_USER =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*\$?$ || $TARGET_USER =~ ^[0-9]+$ \
@@ -705,7 +714,10 @@ detect_system() {
             0x0280*)
                 name=$(pci_name "$dev")
                 WIFI_NAMES+=("$name")
-                if [[ $vendor == 0x14e4 && $device =~ $WL_DEVICE_REGEX ]] && ! has_wireless_phy "$dev"; then
+                # Once wl itself is loaded the chip has a wireless interface too, so an
+                # installed broadcom-wl still counts.
+                if [[ $vendor == 0x14e4 && $device =~ $WL_DEVICE_REGEX ]] \
+                    && { is_installed broadcom-wl || ! has_wireless_phy "$dev"; }; then
                     NEEDS_BROADCOM_WL=1
                 fi
                 ;;
@@ -851,7 +863,7 @@ status_dnf() {
     is_true "$(dnf_conf_value fastestmirror)" && good=$((good + 1))
     is_true "$(dnf_conf_value defaultyes)" && good=$((good + 1))
     mpd=$(dnf_conf_value max_parallel_downloads)
-    if [[ $mpd =~ ^[0-9]+$ ]] && (( mpd >= 10 )); then
+    if [[ $mpd =~ ^[0-9]+$ ]] && (( 10#$mpd >= 10 )); then
         good=$((good + 1))
     fi
     case $good in
@@ -925,7 +937,7 @@ status_drivers() {
                 if ! modinfo -k "$running" nvidia &>/dev/null; then
                     missing+=("nvidia module for the running kernel")
                 elif [[ ! -d $ROOT/sys/module/nvidia ]]; then
-                    missing+=("a reboot to load it$( ((SECURE_BOOT)) && echo ' (and Secure Boot key enrollment)')")
+                    missing+=("a reboot to load it$( ((! SECURE_BOOT)) || echo ' (and Secure Boot key enrollment)')")
                 fi
             else
                 missing+=("NVIDIA driver")
@@ -937,7 +949,7 @@ status_drivers() {
                 if ! modinfo -k "$running" wl &>/dev/null; then
                     missing+=("wl module for the running kernel")
                 elif [[ ! -d $ROOT/sys/module/wl ]]; then
-                    missing+=("a reboot to load it$( ((SECURE_BOOT)) && echo ' (and Secure Boot key enrollment)')")
+                    missing+=("a reboot to load it$( ((! SECURE_BOOT)) || echo ' (and Secure Boot key enrollment)')")
                 fi
             else
                 missing+=("broadcom-wl")
@@ -1001,8 +1013,8 @@ flathub_config() {  # $1 = key
 }
 
 status_flathub() {
-    local missing=() cfg=$ROOT/var/lib/flatpak/repo/config origins
-    command -v flatpak &>/dev/null || missing+=(Flatpak)
+    local missing=() cfg=$ROOT/var/lib/flatpak/repo/config origins no_flatpak=0
+    command -v flatpak &>/dev/null || { missing+=(Flatpak); no_flatpak=1; }
     is_installed plasma-discover-flatpak || missing+=("Discover's Flatpak support")
     if [[ ! -r $cfg ]] || ! grep -qx '\[remote "flathub"\]' "$cfg"; then
         missing+=(Flathub)
@@ -1024,7 +1036,7 @@ status_flathub() {
     fi
     if (( ${#missing[@]} == 0 )); then
         set_status flathub "done" "already set up"
-    elif [[ " ${missing[*]} " == *" Flatpak "* && ${#missing[@]} -ge 3 ]]; then
+    elif (( no_flatpak && ${#missing[@]} >= 3 )); then
         set_status flathub todo ""
     else
         set_status flathub partial "missing $(join_missing "${missing[@]}")"
@@ -1471,7 +1483,7 @@ MENU_ACTIVE=0
 MENU_ROW_ITEM=()
 
 leave_menu() {
-    printf '\e[?1006l\e[?1000l\e[?25h\e[?1049l' >/dev/tty 2>/dev/null || true
+    printf '\e[?1006l\e[?1000l\e[?25h\e[?1049l' 2>/dev/null >/dev/tty || true
     trap - WINCH
     MENU_ACTIVE=0
 }
@@ -1845,7 +1857,7 @@ step_header() {  # $1 = index, $2 = total, $3 = percent, $4 = step
     if (( TTY_OUT )); then
         printf '\n%s━━ %s ━━%s\n' "$C_BOLD$C_BLUE" "$text" "$C_RESET"
         printf '%s%s%s\n' "$C_GREEN" "$(progress_bar "$pct")" "$C_RESET"
-        printf '\e]0;fedora-kde-setup · Step %d/%d · %d%%\a' "$i" "$n" "$pct" >/dev/tty 2>/dev/null || true
+        printf '\e]0;fedora-kde-setup · Step %d/%d · %d%%\a' "$i" "$n" "$pct" 2>/dev/null >/dev/tty || true
     else
         printf '\n== %s (%d%%) ==\n' "$text" "$pct"
     fi
@@ -1965,7 +1977,7 @@ ensure_dnf_option() {  # $1 = key, $2 = value, $3 = bool | min
         info "$key is already set"
         return 0
     fi
-    if [[ $3 == min && $current =~ ^[0-9]+$ ]] && (( current >= value )); then
+    if [[ $3 == min && $current =~ ^[0-9]+$ ]] && (( 10#$current >= value )); then
         info "Kept your $key=$current"
         return 0
     fi
@@ -1997,9 +2009,9 @@ step_update() {
     run "$DNF" upgrade --refresh -y
     NEWEST_KERNEL=$(newest_kernel)
     if [[ $NEWEST_KERNEL != "$KERNEL_BEFORE" ]]; then
-        REBOOT_REASONS+=("to start the new kernel")
+        add_reboot_reason "to start the new kernel"
     elif [[ $(last_transaction_id) != "$history_before" ]]; then
-        REBOOT_REASONS+=("so updated system services and libraries are used")
+        add_reboot_reason "so updated system services and libraries are used"
     fi
     ok "System upgraded${NEWEST_KERNEL:+ (newest kernel: $NEWEST_KERNEL)}"
 }
@@ -2119,8 +2131,15 @@ step_codecs() {
         gstreamer1-plugin-openh264 mozilla-openh264 lame ffmpegthumbs libva-utils \
         || warn "Some codec packages failed to install"
     if check_installed ffmpeg gstreamer1-plugins-bad-freeworld gstreamer1-plugins-ugly gstreamer1-plugin-libav; then
-        ok "Codecs: ffmpeg, GStreamer bad/ugly/libav, OpenH264, LAME"
+        ok "Codecs: ffmpeg, GStreamer bad/ugly/libav, LAME"
     else
+        STEP_OK=0
+    fi
+    # OpenH264 comes from Cisco's own server, which is sometimes unreachable.
+    if (( DRY_RUN )) || is_installed gstreamer1-plugin-openh264; then
+        ok "OpenH264 (H.264 video in Firefox and GStreamer)"
+    else
+        warn "OpenH264 couldn't be installed (Cisco's download server may be down); run the codecs step again later"
         STEP_OK=0
     fi
 
@@ -2306,7 +2325,7 @@ build_kmods() {
     info "Building kernel modules for $NEWEST_KERNEL (a few minutes)"
     dnf_install "kernel-devel-$NEWEST_KERNEL" || warn "Couldn't install kernel-devel-$NEWEST_KERNEL"
     run akmods --force --kernels "$NEWEST_KERNEL" || warn "akmods reported a problem"
-    REBOOT_REASONS+=("to load the new drivers")
+    add_reboot_reason "to load the new drivers"
     if (( DRY_RUN )); then
         return 0
     fi
@@ -2357,7 +2376,7 @@ step_drivers() {
         build_kmods
         if { (( NVIDIA_INSTALLED )) && [[ ! -d $ROOT/sys/module/nvidia ]]; } \
             || { (( WL_INSTALLED )) && [[ ! -d $ROOT/sys/module/wl ]]; }; then
-            REBOOT_REASONS+=("to load the new drivers")
+            add_reboot_reason "to load the new drivers"
         fi
     fi
 }
@@ -2553,13 +2572,22 @@ step_flathub() {
     done
 
     # Make Flatpak (Flathub) Discover's default source, like Discover's own "Make default" button.
-    if [[ -n $TARGET_HOME ]] && command -v kwriteconfig6 &>/dev/null; then
-        run_as_user kwriteconfig6 --file "$TARGET_HOME/.config/discoverrc" --group ResourcesModel \
-            --key currentApplicationBackend flatpak-backend || warn "Couldn't make Flathub Discover's default source"
-    else
+    local default_set=0
+    if [[ -z $TARGET_HOME ]]; then
+        warn "Couldn't tell whose Discover to set up (run the script with sudo from your account, or --user NAME); pick Flathub in Discover > Settings"
+    elif ! command -v kwriteconfig6 &>/dev/null; then
         warn "Couldn't make Flathub Discover's default source (kwriteconfig6 not found); pick it in Discover > Settings"
+    elif run_as_user kwriteconfig6 --file "$TARGET_HOME/.config/discoverrc" --group ResourcesModel \
+            --key currentApplicationBackend flatpak-backend; then
+        default_set=1
+    else
+        warn "Couldn't make Flathub Discover's default source; pick it in Discover > Settings"
     fi
-    ok "Flathub enabled, unfiltered, and Discover's default source"
+    if (( default_set )); then
+        ok "Flathub enabled, unfiltered, and Discover's default source"
+    else
+        ok "Flathub enabled and unfiltered"
+    fi
 }
 
 step_firmware() {
@@ -2579,7 +2607,7 @@ step_firmware() {
     "${cmd[@]}" || rc=$?
     case $rc in
         0) ok "Firmware updated (some updates are applied on reboot)"
-           REBOOT_REASONS+=("to apply the firmware updates") ;;
+           add_reboot_reason "to apply the firmware updates" ;;
         2) if (( refreshed )); then ok "Firmware already up to date"; else STEP_OK=0; fi ;;
         *) warn "fwupdmgr exited with $rc; run 'fwupdmgr update' manually later (laptops must be on AC power)"
            STEP_OK=0 ;;
@@ -2600,11 +2628,11 @@ finish() {
     if (( n_failed == 0 )); then
         color=$C_GREEN verdict="All $n_run step$( ((n_run == 1)) || echo s) finished."
     else
-        color=$C_YELLOW verdict="$n_run of $((n_run + n_failed)) steps finished; $n_failed need$( ((n_failed == 1)) && echo s) attention (see below)."
+        color=$C_YELLOW verdict="$n_run of $((n_run + n_failed)) steps finished; $n_failed need$( ((n_failed != 1)) || echo s) attention (see below)."
     fi
     if (( TTY_OUT )); then
         printf '\n%s━━ %s ━━%s\n%s%s%s\n' "$C_BOLD$color" "$verdict" "$C_RESET" "$color" "$(progress_bar 100)" "$C_RESET"
-        printf '\e]0;fedora-kde-setup: done\a' >/dev/tty 2>/dev/null || true
+        printf '\e]0;fedora-kde-setup: done\a' 2>/dev/null >/dev/tty || true
     else
         printf '\n== %s ==\n' "$verdict"
     fi
@@ -2654,7 +2682,7 @@ ${C_BOLD}${C_YELLOW}Secure Boot key enrollment on next boot:${C_RESET}
 MOK
         if [[ -n $MOK_GENERATED_PASSWORD ]]; then
             printf '  %sYour one-time password: %s%s  (shown only here, not in the log)\n' \
-                "$C_BOLD" "$MOK_GENERATED_PASSWORD" "$C_RESET" >/dev/tty 2>/dev/null || true
+                "$C_BOLD" "$MOK_GENERATED_PASSWORD" "$C_RESET" 2>/dev/null >/dev/tty || true
         fi
     fi
 
