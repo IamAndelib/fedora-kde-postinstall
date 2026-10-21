@@ -105,7 +105,10 @@ new_scenario_dirs() {  # $1 = scenario name
     R=$T/root
     S=$T/state
     H="$T/home/tester home"
-    CALLS=$T/calls.log
+    # Not directly in $T: under sudo $T becomes a root-owned sticky dir, where the kernel's
+    # protected_regular setting (on in Ubuntu) stops root appending to files we created.
+    mkdir "$T/log"
+    CALLS=$T/log/calls.log
     OUT=$T/out.txt
     STUBDIR=$T/stubs
     MISSING=()
