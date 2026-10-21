@@ -2496,7 +2496,7 @@ sc_menu_wheel_clamp() {
     expect_out_fixed 'Nothing was changed.'
 }
 
-scenario menu_click_toggle "pty" "Menu: a click on a step row (or its explanation) selects it; the release is ignored"
+scenario menu_click_toggle "pty" "Menu: a click on a step row selects it (its explanation line doesn't); the release is ignored"
 sc_menu_click_toggle() {
     AUTO_ALL=0
     menu_machine
@@ -2516,15 +2516,24 @@ sc_menu_click_toggle() {
     expect_rc 0
     expect_out_fixed 'Select at least one step first'
     expect_no_out 'Ready to start'
-    # In a big window every step shows its explanation under it; a click there counts too.
+    # In a big window every step shows its explanation under it. Those lines don't take
+    # clicks: one sits right above the next step, where a click meant for that step lands
+    # if it's a little too high, and it must not toggle the step above.
     PTY_ROWS=50 PTY_COLS=120
     PTY_INPUT='q'
     invoke --no-reboot
-    local why fw_why
-    why=$(frame_row 'Picks the fastest mirror')
+    local fw_why fw_big
     fw_why=$(frame_row 'Installs BIOS/UEFI and device firmware updates')
-    check "explanation lines found at 120x50 (rows $why, $fw_why)" test "$why" -gt 0 -a "$fw_why" -gt 0
-    PTY_INPUT=$(keys n "$(click "$fw_why")" "$KEY_END" "$ENTER")$START_NO
+    fw_big=$(frame_row 'Firmware updates')
+    check "explanation line found at 120x50 (row $fw_why)" test "$fw_why" -gt 0
+    check "the line above the Firmware step is the previous step's explanation" \
+        test "$(first_frame | sed -n "$((fw_big - 1))p" | cut -c1-8)" == "        "
+    PTY_INPUT=$(keys n "$(click "$fw_why")" "$(click $((fw_big - 1)))" "$KEY_END" "$ENTER" q)
+    invoke --no-reboot
+    expect_rc 0
+    expect_out_fixed 'Select at least one step first'
+    expect_no_out 'Ready to start'
+    PTY_INPUT=$(keys n "$(click "$fw_big")" "$KEY_END" "$ENTER")$START_NO
     invoke --no-reboot
     expect_review_only 'Firmware updates'
     PTY_ROWS=24 PTY_COLS=80

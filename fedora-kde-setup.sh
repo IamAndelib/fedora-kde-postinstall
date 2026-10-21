@@ -1385,12 +1385,13 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
                 esac
                 last=$group
             fi
+            # Only the step's own line takes clicks: its explanation sits right above the
+            # next step, where a click meant for that step could otherwise land.
             item_line[$i]=${#middle[@]}
             line_item[${#middle[@]}]=$i
             middle+=("$(menu_row "$id" $(( i == cur )) "$width")")
             if (( why_all )); then
-                line_item[${#middle[@]}]=$i
-                middle+=("        $(trunc "${STEP_WHY[$id]}" $((width - 8)))")
+                middle+=("        $C_DIM$(trunc "${STEP_WHY[$id]}" $((width - 8)))$C_RESET")
             fi
         done
         total=$(( ${#top[@]} + ${#middle[@]} + ${#bottom[@]} ))
@@ -1409,14 +1410,10 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
         return 0
     fi
     if (( total > TERM_ROWS - 1 )); then
-        # Scroll only as far as needed to keep the highlighted step (and its explanation)
-        # in view, so the list doesn't jump around under the mouse.
-        local focus_end
+        # Scroll only as far as needed to keep the highlighted step in view, so the list
+        # doesn't jump around under the mouse. (Explanations under the steps are only shown
+        # when everything fits, so a scrolled list has one line per step.)
         if (( cur < ${#items[@]} )); then focus=${item_line[$cur]}; else focus=$(( ${#middle[@]} - 1 )); fi
-        focus_end=$focus
-        if [[ ${line_item[focus + 1]:-} == "${line_item[focus]:-x}" ]]; then
-            focus_end=$(( focus + 1 ))
-        fi
         start=$MENU_START
         if (( focus < start )); then
             start=$focus
@@ -1425,8 +1422,8 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
                 start=$(( start - 1 ))
             fi
         fi
-        if (( focus_end >= start + room )); then
-            start=$(( focus_end - room + 1 ))
+        if (( focus >= start + room )); then
+            start=$(( focus - room + 1 ))
         fi
         (( start <= ${#middle[@]} - room )) || start=$(( ${#middle[@]} - room ))
         (( start >= 0 )) || start=0
@@ -1455,6 +1452,9 @@ draw_menu() {  # $1 = cursor row, $2 = message, rest = selectable step IDs
 
     printf '\e[H\e[2J'
     printf '%s\n' "${top[@]}" "${middle[@]}" "${bottom[@]}"
+    # Park the cursor at the top: stray text (say, the log catching up) then overwrites the
+    # title instead of scrolling the menu, which would put every row one line off.
+    printf '\e[H'
 }
 
 menu_help() {
@@ -1508,8 +1508,10 @@ read_menu_key() {
         rc=0
         IFS= read -rsn1 -t 0.5 c </dev/tty || rc=$?
         (( rc > 128 )) || break
-        # Nothing typed for a while: redraw if the window was resized meanwhile.
-        if [[ $(stty size </dev/tty 2>/dev/null) != "$TERM_SIZE" ]]; then
+        # Nothing typed for a while: redraw if the window was resized meanwhile, and once
+        # right after the menu opened, in case the log's last lines reached the screen late.
+        if (( MENU_SETTLE )) || [[ $(stty size </dev/tty 2>/dev/null) != "$TERM_SIZE" ]]; then
+            MENU_SETTLE=0
             MENU_KEY=resize
             return 0
         fi
@@ -1568,11 +1570,11 @@ read_menu_key() {
     return 0
 }
 
-MENU_ACTIVE=0 MENU_STTY="" TERM_SIZE="" TITLE_SET=0 MENU_START=0
+MENU_ACTIVE=0 MENU_STTY="" TERM_SIZE="" TITLE_SET=0 MENU_START=0 MENU_SETTLE=0
 MENU_ROW_ITEM=()
 
 enter_menu() {
-    MENU_ACTIVE=1
+    MENU_ACTIVE=1 MENU_SETTLE=1
     # No echo between key reads, so keys pressed during a redraw don't show up as ^[[B.
     MENU_STTY=$(stty -g </dev/tty 2>/dev/null || true)
     stty -echo -icanon </dev/tty 2>/dev/null || true
